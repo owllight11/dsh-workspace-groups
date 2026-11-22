@@ -1,7 +1,7 @@
 /**
- * Shared config types for dsh-workspace-groups. Pure types (zero runtime
- * deps) so both halves — the node half (sidecar YAML reading) and the
- * browser half (tree derivation) — compile against the same contract.
+ * Shared config types and multi-level category path utilities for
+ * `@dsh-xhl/workspace-groups`. Pure types & helpers (zero runtime deps) so both
+ * the node half and the browser half share identical semantics.
  */
 
 /** One classification rule: any rule that matches places the workspace in the category. */
@@ -18,7 +18,7 @@ export interface GroupRule {
 
 /** One category folder in the sidebar tree. */
 export interface GroupCategory {
-  /** Display label of the category folder. */
+  /** Display label or `/` path of the category folder. */
   name: string
   /** Rules; a workspace is classified here when ANY rule matches. */
   rules: GroupRule[]
@@ -28,82 +28,139 @@ export interface GroupCategory {
 export interface GroupsConfig {
   /** Category folders, in render order. First match wins. */
   categories: GroupCategory[]
-  /**
-   * Runtime grouping overlay (manual groups + per-workspace overrides).
-   * Optional: the YAML file itself never carries it — the host GET route
-   * merges it from `workspace-groups.manual.json`, and the browser PUT route
-   * replaces it whole.
-   */
+  /** Runtime grouping overlay (manual groups + per-workspace overrides). */
   manual?: ManualGroups
 }
 
 /**
  * Runtime-managed grouping overlay: groups created in the sidebar UI plus
  * per-workspace category overrides and user-controlled ordering. Owned by the
- * plugin (JSON sidecar, `$DSH_HOME/workspace-groups.manual.json`), never
- * written back into the operator YAML.
- *
- * All new fields are optional for backward compatibility (files written by
- * older plugin versions keep working); rendering falls back to sensible
- * defaults when they are absent.
+ * plugin (JSON sidecar, `$DSH_HOME/workspace-groups.manual.json`).
  */
 export interface ManualGroups {
-  /**
-   * Manually created category folder names. These have no rules — they render
-   * even while empty (a new group appears before anything is dragged into
-   * it) and hold only workspaces assigned to them.
-   */
+  /** Manually created category folder keys (supports `/` for nested folders). */
   categories: string[]
-  /**
-   * Per-workspace category override, keyed by workspace id. Value is a
-   * category display name (rule or manual), or `null` to force the workspace
-   * into the uncategorized bucket even when a rule would match. An absent
-   * key means "classify by rules".
-   */
+  /** Per-workspace category override, keyed by workspace id (`null` = top-level). */
   assignments: Record<string, string | null>
-  /**
-   * Display order of all category keys (rule display names + manual names).
-   * The uncategorized bucket is never listed — it always renders last.
-   * Absent = rule categories first (YAML order), manual groups appended in
-   * creation order.
-   */
+  /** Display order of all category keys (rule display keys + manual keys). */
   categoryOrder?: string[]
-  /**
-   * Per-category ordered workspace ids (user drag-reorder within a group).
-   * Keyed by category display name; absent key = host registration order.
-   */
+  /** Per-category ordered workspace ids. */
   workspaceOrder?: Record<string, string[]>
-  /**
-   * Rule category rename overrides: original YAML rule category name →
-   * display name (UI rename of a rule group). Rules still classify by the
-   * original name; only the rendered label/keys change.
-   */
+  /** Rule category rename/reparent overrides: original YAML rule name → display path key. */
   renamed?: Record<string, string>
-  /**
-   * Rule category original names hidden by a UI delete. Hidden rules are
-   * inert: workspaces matching them become top-level (ungrouped).
-   */
+  /** Rule category original names hidden by a UI delete. */
   hidden?: string[]
+}
+
+/** Overlay with every optional field materialized. */
+export type NormalizedManual = Required<ManualGroups>
+
+export const EMPTY_MANUAL: NormalizedManual = {
+  categories: [],
+  assignments: {},
+  categoryOrder: [],
+  workspaceOrder: {},
+  renamed: {},
+  hidden: [],
+}
+
+/** Materialize optional overlay fields so updates are plain object edits. */
+export function normalizeManual(manual: ManualGroups): NormalizedManual {
+  return {
+    categories: manual.categories,
+    assignments: manual.assignments,
+    categoryOrder: manual.categoryOrder ?? [],
+    workspaceOrder: manual.workspaceOrder ?? {},
+    renamed: manual.renamed ?? {},
+    hidden: manual.hidden ?? [],
+  }
 }
 
 /**
  * Legacy label of the fallback bucket. The top-level (ungrouped) concept
- * replaced the rendered "未分类" bucket: workspaces in no group render as
- * top-level rows beside the group folders. The constant survives for data
+ * replaced the rendered "未分类" bucket. The constant survives for data
  * compatibility (reserved name, assignment null marker).
  */
 export const UNCATEGORIZED_LABEL = '未分类'
 
-/**
- * Reserved key under `workspaceOrder` holding the manual order of TOP-LEVEL
- * (ungrouped) project rows. Distinct from any real group display name (a group
- * may not be named this), so it can never collide; the top-level list's order
- * is preserved exactly like a group's, and top-level rows can be reordered by
- * dragging.
- */
+/** Reserved key under `workspaceOrder` holding the manual order of top-level rows. */
 export const TOP_LEVEL_ORDER_KEY = '__topLevel__'
 
-/** Normalize a path for prefix matching: trailing slashes stripped. */
+/** Canonical separator for nested folder paths (e.g. `Windows主机/MKINSP`). */
+export const CATEGORY_PATH_SEPARATOR = '/'
+
+/** Normalize a filesystem path for prefix matching: trailing slashes stripped. */
 export function normalizePath(path: string): string {
   return path.replace(/[/\\]+$/, '')
+}
+
+/** Split a category key into trimmed segments (preserves empty segments for validation). */
+export function splitCategoryPath(key: string): string[] {
+  const trimmed = key.trim()
+  if (trimmed === '') return []
+  return trimmed.split(CATEGORY_PATH_SEPARATOR).map(seg => seg.trim())
+}
+
+/**
+ * Normalize and validate a category path string.
+ * Rejects empty input, leading/trailing `/`, empty `//` segments, and reserved
+ * segment names (`未分类`, `__topLevel__`).
+ */
+export function normalizeCategoryPath(raw: string): string | null {
+  const segments = splitCategoryPath(raw)
+  if (segments.length === 0) return null
+  for (const seg of segments) {
+    if (seg === '' || seg === UNCATEGORIZED_LABEL || seg === TOP_LEVEL_ORDER_KEY) {
+      return null
+    }
+  }
+  return segments.join(CATEGORY_PATH_SEPARATOR)
+}
+
+/** Parent folder key of a nested category, or `undefined` at root level. */
+export function parentCategoryKey(key: string): string | undefined {
+  const idx = key.lastIndexOf(CATEGORY_PATH_SEPARATOR)
+  return idx <= 0 ? undefined : key.slice(0, idx)
+}
+
+/** Display leaf name (last segment) of a category path. */
+export function categoryLeafName(key: string): string {
+  const idx = key.lastIndexOf(CATEGORY_PATH_SEPARATOR)
+  return idx < 0 ? key : key.slice(idx + 1)
+}
+
+/** Join an optional parent key and a leaf segment into a canonical path key. */
+export function joinCategoryPath(parentKey: string | undefined, leafName: string): string {
+  return parentKey === undefined || parentKey === ''
+    ? leafName
+    : `${parentKey}${CATEGORY_PATH_SEPARATOR}${leafName}`
+}
+
+/** Ancestor keys from outermost root to direct parent (e.g. `A/B/C` -> `['A', 'A/B']`). */
+export function ancestorCategoryKeys(key: string): string[] {
+  const parts = splitCategoryPath(key)
+  const ancestors: string[] = []
+  for (let i = 1; i < parts.length; i += 1) {
+    ancestors.push(parts.slice(0, i).join(CATEGORY_PATH_SEPARATOR))
+  }
+  return ancestors
+}
+
+/** True when `candidate` equals `ancestor` or sits strictly inside `ancestor/`. */
+export function isSameOrDescendantCategory(candidate: string, ancestor: string): boolean {
+  return candidate === ancestor || candidate.startsWith(`${ancestor}${CATEGORY_PATH_SEPARATOR}`)
+}
+
+/** Rewrite `oldPrefix` (and `oldPrefix/...`) to `newPrefix` (and `newPrefix/...`). */
+export function replaceCategoryPrefix(key: string, oldPrefix: string, newPrefix: string): string {
+  if (key === oldPrefix) return newPrefix
+  if (key.startsWith(`${oldPrefix}${CATEGORY_PATH_SEPARATOR}`)) {
+    return `${newPrefix}${key.slice(oldPrefix.length)}`
+  }
+  return key
+}
+
+/** Format a category path as a readable breadcrumb (`A/B` -> `A › B`). */
+export function formatCategoryBreadcrumb(key: string): string {
+  return splitCategoryPath(key).join(' › ')
 }

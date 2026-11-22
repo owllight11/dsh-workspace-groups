@@ -32,20 +32,33 @@ export type WorkspaceGroupsKey =
   | 'workspace.renameConfirm'
   | 'workspace.renameCancel'
   | 'workspace.moveOutOfGroup'
+  | 'workspace.openInFolder'
+  | 'workspace.openInFolderError'
   | 'group.create'
   | 'group.createTitle'
+  | 'group.createSubgroup'
+  | 'group.createSubgroupTitle'
   | 'group.createPlaceholder'
   | 'group.createConfirm'
   | 'group.createCancel'
+  | 'group.parentLabel'
+  | 'group.pathHint'
+  | 'group.moveToRoot'
+  | 'group.dropNestBadge'
   | 'group.rename'
   | 'group.renameTitle'
   | 'group.renameConfirm'
   | 'group.delete'
   | 'group.deleteTitle'
   | 'group.deleteConfirm'
+  | 'group.deleteConfirmNested'
   | 'group.deleteCancel'
   | 'group.nameDuplicate'
   | 'group.nameReserved'
+  | 'group.nameInvalid'
+  | 'group.nameCycle'
+  | 'group.moveDuplicateError'
+  | 'group.moveCycleError'
   | 'section.topLevel'
   | 'manual.saveError'
   | 'session.new'
@@ -68,6 +81,21 @@ export type WorkspaceGroupsKey =
   | 'collapse'
   | 'expandMore'
   | 'newSession'
+  | 'quick.title'
+  | 'quick.tab.workspaces'
+  | 'quick.tab.sessions'
+  | 'quick.search.placeholder'
+  | 'quick.search.sessions'
+  | 'quick.empty.workspaces'
+  | 'quick.action.newSession'
+  | 'quick.action.running'
+  | 'quick.action.noneRunning'
+  | 'quick.empty.sessions'
+  | 'quick.select.hint'
+  | 'quick.hint'
+  | 'tabs.aria'
+  | 'tabs.close'
+  | 'tabs.archive'
 
 export type WorkspaceGroupsDict = LocaleDictOf<'workspaceGroups'>
 
@@ -99,20 +127,33 @@ export const zh: WorkspaceGroupsDict = {
   'workspace.renameConfirm': '重命名',
   'workspace.renameCancel': '取消',
   'workspace.moveOutOfGroup': '移出分组',
+  'workspace.openInFolder': '在文件夹中打开',
+  'workspace.openInFolderError': '打开文件夹失败',
   'group.create': '新建分组',
   'group.createTitle': '新建分组',
-  'group.createPlaceholder': '分组名称',
+  'group.createSubgroup': '新建子分组',
+  'group.createSubgroupTitle': '新建子分组',
+  'group.createPlaceholder': '分组名称（支持 / 创建多级）',
   'group.createConfirm': '创建',
   'group.createCancel': '取消',
+  'group.parentLabel': '上级分组',
+  'group.pathHint': '可用 / 分隔创建多级文件夹，例如 Windows主机/MKINSP',
+  'group.moveToRoot': '移至顶层',
+  'group.dropNestBadge': '移入',
   'group.rename': '重命名分组',
   'group.renameTitle': '重命名分组',
   'group.renameConfirm': '重命名',
   'group.delete': '删除分组',
   'group.deleteTitle': '删除分组',
   'group.deleteConfirm': '删除后，该分组内的所有项目将移到顶层（不归组）。确定删除？',
+  'group.deleteConfirmNested': '删除后将同时移除其下所有子分组；包含的所有项目不会被删除，将全部移到顶层。确定删除？',
   'group.deleteCancel': '取消删除',
   'group.nameDuplicate': '已存在同名分组',
   'group.nameReserved': '该名称不可用',
+  'group.nameInvalid': '分组路径无效（不能包含空层级或首尾 /）',
+  'group.nameCycle': '不能移动到自身或子分组下',
+  'group.moveDuplicateError': '目标位置已存在同名分组，无法移入',
+  'group.moveCycleError': '不能将分组移入自身或子分组中',
   'section.topLevel': '顶层项目',
   'manual.saveError': '分组变更保存失败',
   'session.new': '新建会话',
@@ -135,6 +176,21 @@ export const zh: WorkspaceGroupsDict = {
   collapse: '折叠',
   expandMore: '展开全部',
   newSession: '新建会话',
+  'quick.title': '快速切换',
+  'quick.tab.workspaces': '工作区',
+  'quick.tab.sessions': '全部会话',
+  'quick.search.placeholder': '搜索工作区…',
+  'quick.search.sessions': '搜索会话…',
+  'quick.empty.workspaces': '没有匹配的工作区',
+  'quick.action.newSession': '新建会话',
+  'quick.action.running': '切到运行中的会话',
+  'quick.action.noneRunning': '没有正在运行的会话',
+  'quick.empty.sessions': '还没有会话',
+  'quick.select.hint': '在上方选择一个工作区',
+  'quick.hint': 'Ctrl+R 开关 · Enter 打开/新建 · Esc 关闭',
+  'tabs.aria': '已打开的会话',
+  'tabs.close': '关闭标签',
+  'tabs.archive': '归档',
 }
 
 /** English dictionary. */
@@ -165,20 +221,33 @@ export const en: WorkspaceGroupsDict = {
   'workspace.renameConfirm': 'Rename',
   'workspace.renameCancel': 'Cancel',
   'workspace.moveOutOfGroup': 'Move out of group',
+  'workspace.openInFolder': 'Open in folder',
+  'workspace.openInFolderError': 'Could not open the folder',
   'group.create': 'New group',
   'group.createTitle': 'New group',
-  'group.createPlaceholder': 'Group name',
+  'group.createSubgroup': 'New subgroup',
+  'group.createSubgroupTitle': 'New subgroup',
+  'group.createPlaceholder': 'Group name (use / for nesting)',
   'group.createConfirm': 'Create',
   'group.createCancel': 'Cancel',
+  'group.parentLabel': 'Parent group',
+  'group.pathHint': 'Use / to create nested folders, e.g. Windows/MKINSP',
+  'group.moveToRoot': 'Move to top level',
+  'group.dropNestBadge': 'Nest',
   'group.rename': 'Rename group',
   'group.renameTitle': 'Rename group',
   'group.renameConfirm': 'Rename',
   'group.delete': 'Delete group',
   'group.deleteTitle': 'Delete group',
   'group.deleteConfirm': 'Deleting removes this group; every project inside it moves to the top level (ungrouped). Delete?',
+  'group.deleteConfirmNested': 'Deleting removes this group and all nested subgroups; projects inside are kept and moved to the top level. Delete?',
   'group.deleteCancel': 'Cancel delete',
   'group.nameDuplicate': 'A group with this name already exists',
   'group.nameReserved': 'This name is not available',
+  'group.nameInvalid': 'Invalid group path (empty segments or leading/trailing "/" not allowed)',
+  'group.nameCycle': 'Cannot move a group inside itself or a subgroup',
+  'group.moveDuplicateError': 'A group with the same name already exists at the destination',
+  'group.moveCycleError': 'Cannot move a group into itself or its subgroup',
   'section.topLevel': 'Top-level projects',
   'manual.saveError': 'Could not save group changes',
   'session.new': 'New Session',
@@ -201,4 +270,19 @@ export const en: WorkspaceGroupsDict = {
   collapse: 'Collapse',
   expandMore: 'Show all',
   newSession: 'New Session',
+  'quick.title': 'Quick switch',
+  'quick.tab.workspaces': 'Workspaces',
+  'quick.tab.sessions': 'All sessions',
+  'quick.search.placeholder': 'Search workspaces…',
+  'quick.search.sessions': 'Search sessions…',
+  'quick.empty.workspaces': 'No matching workspaces',
+  'quick.action.newSession': 'New Session',
+  'quick.action.running': 'Switch to running session',
+  'quick.action.noneRunning': 'No running session',
+  'quick.empty.sessions': 'No sessions yet',
+  'quick.select.hint': 'Pick a workspace above',
+  'quick.hint': 'Ctrl+R toggle · Enter open/new · Esc close',
+  'tabs.aria': 'Open sessions',
+  'tabs.close': 'Close tab',
+  'tabs.archive': 'Archive',
 }

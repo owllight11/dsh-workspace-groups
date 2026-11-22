@@ -8,7 +8,7 @@
  * workspace rows, standing for their containing category) are drop targets.
  * The payload is a custom dataTransfer type so only in-plugin drags land.
  */
-import { type DragEvent } from 'react';
+import { type DragEvent, type ReactNode } from 'react';
 import { type StateDotState } from '@deepseek-ai/dsh-client-ui-primitives';
 import type { TranslateNS } from '@deepseek-ai/dsh-client-ui-slots';
 import type { CategoryNode, SessionNode, WorkspaceGroupNode } from './tree.ts';
@@ -37,24 +37,29 @@ export interface RowDropProps {
     onRowDrop?: (event: DragEvent) => void;
 }
 /**
- * One category folder row: toggle, rename/delete menu (every group — rule
- * groups via overlay renames/hides), draggable source for group reorder and
- * drop target for both workspace moves and group reorders.
+ * One category folder row: supports arbitrary nesting depth, toggle,
+ * subgroup creation / move-to-root / rename / delete menu, draggable source
+ * for group reorder/reparenting, and 3-zone drop target.
  */
-export declare function CategoryRow({ node, t, onToggle, onRename, onDelete, dropActive, insertLine, onRowDragOver, onRowDragLeave, onRowDrop, onDragStartCategory }: {
+export declare function CategoryRow({ node, t, onToggle, onCreateSubgroup, onMoveToRoot, onRename, onDelete, dropNestLabel, dropActive, insertLine, onRowDragOver, onRowDragLeave, onRowDrop, onDragStartCategory, }: {
     node: CategoryNode;
     t: T;
     onToggle: () => void;
+    onCreateSubgroup?: () => void;
+    onMoveToRoot?: () => void;
     /** Rename/delete actions; the hover menu renders only when both provided. */
     onRename?: () => void;
     onDelete?: () => void;
-    /** Group reorder source; the row becomes draggable only when provided. */
+    dropNestLabel?: string;
+    /** Group reorder/reparent source; the row becomes draggable only when provided. */
     onDragStartCategory?: (event: DragEvent) => void;
 } & RowDropProps): import("react").JSX.Element;
 /** One workspace folder row inside a category: draggable source + drop target. */
-export declare function WorkspaceRow({ node, t, onToggle, onNewSession, onRename, onDelete, canMoveOut, onMoveOut, flat, dropActive, insertLine, onRowDragOver, onRowDragLeave, onRowDrop, onDragStartExtra }: {
+export declare function WorkspaceRow({ node, t, depth, onToggle, onNewSession, onRename, onDelete, canMoveOut, onMoveOut, onOpenInFolder, flat, dropActive, insertLine, onRowDragOver, onRowDragLeave, onRowDrop, onDragStartExtra }: {
     node: WorkspaceGroupNode;
     t: T;
+    /** Visual tree depth (`0` for top-level, `category.depth + 1` inside groups). */
+    depth?: number;
     onToggle: () => void;
     onNewSession: () => void;
     onRename: () => void;
@@ -62,17 +67,36 @@ export declare function WorkspaceRow({ node, t, onToggle, onNewSession, onRename
     /** Project currently sits inside a group — offer "move out of group". */
     canMoveOut?: boolean;
     onMoveOut?: () => void;
+    /**
+     * Open the project directory in the host's file manager. Omitted when the
+     * host resolved no folder application (no capability, or a remote launch),
+     * which keeps the entry out of the menu entirely.
+     */
+    onOpenInFolder?: () => void;
     /** Render as a top-level row (no folder indentation). */
     flat?: boolean;
     /** Extra dragstart hook (e.g. collapse all expanded projects while dragging). */
     onDragStartExtra?: () => void;
 } & RowDropProps): import("react").JSX.Element;
+/**
+ * Children container for one folder's rows.
+ *
+ * Keeps the tree's `role="group"` semantics and gives the rows a single
+ * positioned ancestor. It used to draw a per-folder guide rail; that is now the
+ * flower branch's job (one continuous stem for the whole tree, see
+ * `FlowerBranch.tsx`), so this is structure only.
+ */
+export declare function TreeChildren({ children }: {
+    children: ReactNode;
+}): import("react").JSX.Element;
 /** One session leaf row. */
-export declare function SessionRow({ node, currentId, now, t, onOpen, onRename, onFork, onArchive }: {
+export declare function SessionRow({ node, currentId, now, t, workspaceDepth, onOpen, onRename, onFork, onArchive }: {
     node: SessionNode;
     currentId: string | undefined;
     now: number;
     t: T;
+    /** Owning workspace tree depth (`0` for top-level, `category.depth + 1` inside groups). */
+    workspaceDepth?: number;
     onOpen: (id: SessionNode['id']) => void;
     onRename: (id: SessionNode['id'], currentTitle: string) => void;
     onFork: (id: SessionNode['id']) => void;

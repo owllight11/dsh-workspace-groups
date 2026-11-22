@@ -1,28 +1,8 @@
-/**
- * tsdown build for dsh-workspace-groups: the host-half lib (lib/index.js, ESM
- * node) plus one browser client bundle (lib/client.js, CJS closure factory).
- *
- * The client bundle replicates the official DSH client-bundle preset
- * (packages/client/tsdown.client.ts, same shape as dsh-better-sidebar and the
- * official ui-* client packages):
- * - externals resolve through the loader module table at runtime (the
- *   PLATFORM_MODULES seed list from packages/client/web/src/platform.ts,
- *   plus the runtime/client exemption),
- * - everything else is inlined into the bundle,
- * - the purity gate rejects any other @deepseek-ai value import: cross-plugin
- *   collaboration goes through cordis services / slots, never value imports,
- * - CSS Modules compile to hashed class maps and inject <style data-plugin>
- *   tags at factory execution,
- * - the artifact registers itself via window.__ModuleLoader__.load({id,
- *   factory}) with the (require) => exports CJS closure shape.
- *
- * Types ship from lib/types (tsc -p tsconfig.build.json), not from tsdown.
- */
-import { readFile } from 'node:fs/promises'
-import { dirname, resolve as resolvePath, isAbsolute } from 'node:path'
 import { existsSync } from 'node:fs'
+import { readFile } from 'node:fs/promises'
 import { builtinModules } from 'node:module'
-import type { UserConfig } from 'tsdown'
+import { dirname, isAbsolute, resolve as resolvePath } from 'node:path'
+import { defineConfig, type UserConfig } from 'tsdown'
 import { transform } from 'lightningcss'
 
 /** Node builtins must never survive into the browser module-loader factory. */
@@ -31,19 +11,19 @@ const NODE_BUILTINS = new Set([
   ...builtinModules.map(id => `node:${id}`),
 ])
 
-/** Module specifiers the web shell shares into the frozen module table (the official PLATFORM_MODULES list, plus the runtime/client exemption). */
+/** Module specifiers the web shell shares into the frozen module table. */
 const CLIENT_EXTERNALS = [
   'react',
   'react/jsx-runtime',
   'react-dom',
   'react-dom/client',
   '@deepseek-ai/cordis',
+  '@deepseek-ai/dsh-client-store',
   '@deepseek-ai/dsh-client-ui-slots',
   '@deepseek-ai/dsh-client-ui-primitives',
   '@deepseek-ai/dsh-client-runtime/client',
 ] as const
 
-/** Requested-from-module-table specifiers (kept as imports, never inlined). */
 function isRequested(specifier: string): boolean {
   return (CLIENT_EXTERNALS as readonly string[]).includes(specifier)
 }
@@ -52,14 +32,12 @@ const INLINE_CSS_QUERY = '?inline'
 const CSS_VIRTUAL_PREFIX = '\0dsh-workspace-groups-inline-css:'
 const CSS_VIRTUAL_SUFFIX = '.mjs'
 
-/** Resolve a relative import to a physical stylesheet (tsdown consumes src/ sources). */
 function sourceAssetPath(source: string, importer: string): string {
   const abs = resolvePath(dirname(importer), source)
   if (existsSync(abs)) return abs
   return source
 }
 
-/** Node half: host plugin (reads the sidecar YAML, serves /workspace-groups config). */
 function nodeConfig(): UserConfig {
   return {
     name: 'dsh-workspace-groups',
@@ -72,22 +50,15 @@ function nodeConfig(): UserConfig {
     dts: false,
     clean: false,
     deps: {
-      alwaysBundle: (specifier: string) => {
-        // js-yaml is the one runtime dependency; bundle it so the artifact is
-        // self-contained (link installs carry no node_modules guarantees).
-        return !NODE_BUILTINS.has(specifier)
-      },
+      alwaysBundle: (specifier: string) => !NODE_BUILTINS.has(specifier),
     },
   }
 }
 
-/** Browser half: client bundle, wrapped as __ModuleLoader__.load. */
 function clientConfig(): UserConfig {
   return {
     name: 'dsh-workspace-groups/client',
     entry: { client: 'src/client/index.ts' },
-    // Shares lib/ with the node half (entryFileNames pins lib/client.js;
-    // clean is off so the node output survives).
     outDir: 'lib',
     format: 'cjs',
     platform: 'browser',
@@ -101,10 +72,6 @@ function clientConfig(): UserConfig {
     },
     plugins: [
       {
-        // Build-time purity gate (mirror of the module-table boundary):
-        // @deepseek-ai/* value imports only through the module-table rows;
-        // cross-plugin value imports are build errors (type-only imports are
-        // erased and never reach this gate).
         name: 'dsh-workspace-groups-client-purity',
         resolveId(source: string) {
           if (!source.startsWith('@deepseek-ai/')) return null
@@ -116,7 +83,6 @@ function clientConfig(): UserConfig {
         },
       },
       {
-        // `*.css?inline` -> compiled CSS text; the plugin injects/cleans it via ctx.effect.
         name: 'dsh-workspace-groups-css-inline',
         resolveId(source: string, importer: string | undefined) {
           if (!source.endsWith(`.css${INLINE_CSS_QUERY}`)) return null
@@ -140,7 +106,7 @@ function clientConfig(): UserConfig {
     ],
     outputOptions: {
       entryFileNames: 'client.js',
-      banner: `window.__ModuleLoader__.load({ id: "dsh-workspace-groups", factory: (require) => {`,
+      banner: `window.__ModuleLoader__.load({ id: "@dsh-xhl/workspace-groups", factory: (require) => {`,
       footer: 'return module.exports; } });',
       intro: 'var module = { exports: {} }; var exports = module.exports;',
     },

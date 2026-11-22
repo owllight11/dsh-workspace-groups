@@ -14,52 +14,64 @@
  * through `PUT /workspace-groups/manual`; the sidecar YAML is never rewritten
  * (rule-group rename/delete ride the overlay `renamed`/`hidden` maps).
  */
-import { useEffect, useMemo, useRef, useState, type DragEvent } from 'react'
+import { useEffect, useMemo, useRef, useState, type CSSProperties, type DragEvent } from 'react'
 import {
   Button,
-  IconCloseFill14,
-  IconFolderOpenOutline16,
-  IconProjectAddOutline16,
-  IconSearchOutline16,
+  IconCloseFillMedium,
+  IconFolderOpenOutlineRegular,
+  IconProjectAddOutlineRegular,
+  IconSearchOutlineRegular,
+  IconWarningOutlineRegular,
   Modal,
+  Toast,
   Tooltip,
 } from '@deepseek-ai/dsh-client-ui-primitives'
-import type { SessionId, SessionListState, SessionSearchResultItem, WorkspaceId, WorkspaceView } from '@deepseek-ai/dsh-client-runtime/client'
+import type { SessionId } from '@deepseek-ai/dsh-session/types'
+import type { SessionListState, SessionSearchResultItem } from '@deepseek-ai/dsh-api-session-controller/client'
+import type { WorkspaceId, WorkspaceView } from '@deepseek-ai/dsh-api-workspace-controller/client'
+import type { SessionStatusSnapshot } from '@deepseek-ai/dsh-client-ui-session/client'
 import {
-  displayCategoryKeys,
+  allCategoryKeys,
+  createCategoryInManual,
+  deleteCategorySubtreeInManual,
   moveAfter,
   moveBefore,
-  originalRuleNameForDisplay,
+  moveCategoryToRootInManual,
+  renameOrMoveCategoryInManual,
+  reorderCategoryInManual,
   resolveCategory,
   takenCategoryNames,
 } from '../core/matcher.ts'
-import { TOP_LEVEL_ORDER_KEY, UNCATEGORIZED_LABEL, type GroupsConfig, type ManualGroups } from '../core/types.ts'
+import {
+  ancestorCategoryKeys,
+  categoryLeafName,
+  EMPTY_MANUAL,
+  formatCategoryBreadcrumb,
+  isSameOrDescendantCategory,
+  joinCategoryPath,
+  normalizeCategoryPath,
+  normalizeManual,
+  parentCategoryKey,
+  replaceCategoryPrefix,
+  TOP_LEVEL_ORDER_KEY,
+  UNCATEGORIZED_LABEL,
+  type GroupsConfig,
+  type ManualGroups,
+  type NormalizedManual,
+} from '../core/types.ts'
 import type { GroupsBrowserProps } from './contract.ts'
-import { deriveGroups, deriveSearchGroups, deriveSearchMatches, deriveTopLevel, UNCATEGORIZED_KEY, type CategoryNode, type WorkspaceGroupNode } from './tree.ts'
-import { CategoryRow, DND_CATEGORY_TYPE, DND_WORKSPACE_TYPE, hasPluginDragType, SessionRow, WorkspaceRow } from './rows.tsx'
+import { deriveGroups, deriveSearchGroups, deriveSearchMatches, deriveTopLevel, currentSessionId, UNCATEGORIZED_KEY, type CategoryNode, type WorkspaceGroupNode } from './tree.ts'
+import { CategoryRow, DND_CATEGORY_TYPE, DND_WORKSPACE_TYPE, hasPluginDragType, SessionRow, TreeChildren, WorkspaceRow } from './rows.tsx'
+import { fetchOpenInApps, folderAppId, openPathInApp } from './open-folder.ts'
+import { QuickPanel } from './QuickPanel.tsx'
+import { SessionTabs } from './SessionTabs.tsx'
+import { FlowerBranch } from './FlowerBranch.tsx'
+import { DirectoryFlowHost, useDirectoryFlowEntry } from './directory-flow.tsx'
 import css from './styles.css?inline'
 
 const SEARCH_DEBOUNCE_MS = 250
 const SEARCH_QUERY_MAX_CODE_UNITS = 500
-
-/** Overlay with every optional field materialized (plain-object edits, no undefined spreads). */
-type NormalizedManual = Required<ManualGroups>
-
-const EMPTY_MANUAL: NormalizedManual = {
-  categories: [], assignments: {}, categoryOrder: [], workspaceOrder: {}, renamed: {}, hidden: [],
-}
-
-/** Materialize optional overlay fields so every update is a plain object edit. */
-function normalizeManual(manual: ManualGroups): NormalizedManual {
-  return {
-    categories: manual.categories,
-    assignments: manual.assignments,
-    categoryOrder: manual.categoryOrder ?? [],
-    workspaceOrder: manual.workspaceOrder ?? {},
-    renamed: manual.renamed ?? {},
-    hidden: manual.hidden ?? [],
-  }
-}
+const SPRING_EXPAND_DELAY_MS = 550
 
 function sanitizeSearchQuery(value: string): string {
   const withoutNul = value.replaceAll('\0', '')
@@ -112,8 +124,8 @@ async function saveManualOverlay(manual: ManualGroups): Promise<void> {
   }
 }
 
-/** One group-management dialog state: create, or rename an existing group. */
-type GroupDialogState = { mode: 'create' } | { mode: 'rename'; from: string } | null
+/** One group-management dialog state: create (optionally nested), or rename an existing group. */
+type GroupDialogState = { mode: 'create'; parentKey?: string } | { mode: 'rename'; from: string } | null
 
 /** Row reference used by drop targets: which kind of row, which key. */
 export type DropRowRef = { kind: 'category' | 'workspace' | 'topLevel'; key: string }
@@ -147,6 +159,7 @@ export function GroupsBrowser({
   expandSidebar,
   useSessions,
   useWorkspaces,
+  useSessionStatus,
   useStore,
   actions,
   startSession,
@@ -160,8 +173,12 @@ export function GroupsBrowser({
   insertSessionBefore,
   createWorkspace,
   pickDirectory,
+  directoryFlow,
   searchSessions,
   searchResultLimit,
+  openTab,
+  useTabs,
+  tabActions,
   t,
 }: GroupsBrowserProps) {
   // Inject the stylesheet once per fiber; dispose removes it (HMR safe).
@@ -171,6 +188,21 @@ export function GroupsBrowser({
     style.textContent = css
     document.head.append(style)
     return () => { style.remove() }
+  }, [])
+
+  // Ctrl+R toggles the quick switch panel. Capture phase + preventDefault:
+  // beats the browser's page-reload default and any shell-level handler.
+  const [quickOpen, setQuickOpen] = useState(false)
+  useEffect(() => {
+    const onKeyDown = (e: KeyboardEvent): void => {
+      if (e.ctrlKey && !e.altKey && !e.metaKey && !e.shiftKey && (e.key === 'r' || e.key === 'R')) {
+        e.preventDefault()
+        e.stopPropagation()
+        setQuickOpen(v => !v)
+      }
+    }
+    window.addEventListener('keydown', onKeyDown, true)
+    return () => window.removeEventListener('keydown', onKeyDown, true)
   }, [])
 
   // Grouping config from the host route + the runtime manual overlay.
@@ -199,10 +231,24 @@ export function GroupsBrowser({
   const workspaceExpansion = useStore(s => s.workspaceExpansion)
 
   const list = useSessions(s => s)
-  const current = list.current
+  const statuses = useSessionStatus(s => s)
+  // 0.1.6: the selected Session is the one retained through `mainView`, not a
+  // `list.current` field (the list snapshot carries catalog facts only).
+  const current = currentSessionId(list)
   const currentWorkspaceKey = current === undefined
     ? undefined
     : (workspaces.find(w => w.sessionIds.includes(current as SessionId))?.workspaceId as string | undefined)
+
+  // Whether the open session is WORKING right now, which is what makes the
+  // flower at the branch's endpoint turn. Read from the unified status snapshot
+  // (the catalog summary alone goes stale), folded together with the session's
+  // own `running` so a subagent-only turn still counts.
+  //
+  // Derived as a boolean on purpose: the overlay re-measures through its own
+  // MutationObserver, so handing it a live value would re-render the tree on
+  // every status tick.
+  const currentRunning = current !== undefined
+    && ((statuses.get(current)?.running ?? false) || (list.byId[current]?.running ?? false))
 
   // Auto-expand the category + workspace containing the current session, but
   // ONLY when the user has never touched that key (`Object.hasOwn`): a
@@ -212,8 +258,12 @@ export function GroupsBrowser({
   useEffect(() => {
     if (current === undefined || currentWorkspaceKey === undefined) return
     const category = categoriesForCurrent(config, workspaces, current, manual)
-    if (category !== undefined && !Object.hasOwn(categoryExpansion, category)) {
-      actions.setCategoryExpanded(category, true)
+    if (category !== undefined) {
+      for (const key of [...ancestorCategoryKeys(category), category]) {
+        if (!Object.hasOwn(categoryExpansion, key)) {
+          actions.setCategoryExpanded(key, true)
+        }
+      }
     }
     if (!Object.hasOwn(workspaceExpansion, currentWorkspaceKey)) {
       actions.setWorkspaceExpanded(currentWorkspaceKey, true)
@@ -224,10 +274,23 @@ export function GroupsBrowser({
   useEffect(() => {
     if (workspacePhase !== 'ready') return
     actions.retainKeys(
-      displayCategoryKeys(config, manual),
+      allCategoryKeys(config, manual),
       workspaces.map(w => w.workspaceId as string),
     )
   }, [actions, config, manual, workspacePhase, workspaces])
+
+  // Session tabs: the strip lives in the conversation column, but its lifecycle
+  // belongs here — the browser already derives the open session for its own tree,
+  // so one effect covers every way a session can be opened (sidebar row,
+  // workspace New Session, quick panel, conversation-header crumbs).
+  //
+  // `statuses` is a dependency on purpose: a session earns its tab when it
+  // STARTS working, which is a status change, not a catalog change. Without it a
+  // conversation that began while already open would never surface a tab.
+  useEffect(() => {
+    if (current === undefined) return
+    openTab(current, statuses.get(current))
+  }, [current, list, statuses, openTab])
 
   const [query, setQuery] = useState('')
   const [searchExpanded, setSearchExpanded] = useState(false)
@@ -237,6 +300,10 @@ export function GroupsBrowser({
   })
   const searchInput = useRef<HTMLInputElement | null>(null)
   const searchRoot = useRef<HTMLDivElement | null>(null)
+  // Box the flower branch measures and paints into. Held as a ref (not state)
+  // because the overlay re-measures on its own MutationObserver; a state update
+  // here would re-render the whole tree on every layout tick.
+  const branchScope = useRef<HTMLDivElement | null>(null)
 
   // Search debounce + abort, same posture as the official browser.
   useEffect(() => {
@@ -285,39 +352,89 @@ export function GroupsBrowser({
   // Which level is being dragged: drives the top-level drop target (project
   // drags only) and which level's rows fold.
   const [dragging, setDragging] = useState<DragLevel>(null)
+  const [draggingNestedCategory, setDraggingNestedCategory] = useState(false)
   const groups = useMemo(
     () => deriveGroups(list, workspaces, archivedSessionIds, config, {
       expandedCategories,
       expandedWorkspaces,
-    }, manual),
-    [list, workspaces, archivedSessionIds, config, manual, expandedCategories, expandedWorkspaces],
+    }, manual, statuses),
+    [list, workspaces, archivedSessionIds, config, manual, statuses, expandedCategories, expandedWorkspaces],
   )
   // Top-level (ungrouped) workspace rows, rendered after the group folders.
   const topLevel = useMemo(
     () => deriveTopLevel(list, workspaces, archivedSessionIds, config, {
       expandedCategories,
       expandedWorkspaces,
-    }, manual),
-    [list, workspaces, archivedSessionIds, config, manual, expandedCategories, expandedWorkspaces],
+    }, manual, statuses),
+    [list, workspaces, archivedSessionIds, config, manual, statuses, expandedCategories, expandedWorkspaces],
   )
-  // While dragging a project, an empty top-level area must still show a landing
-  // line — otherwise a project can never be dragged OUT of a group when every
-  // project is currently grouped.
-  const topLevelDropActive = dragging === 'workspace' && topLevel.length === 0
+  // Quick panel (Ctrl+R): formatted category breadcrumb per grouped workspace id.
+  const categoryByWorkspace = useMemo(() => {
+    const map = new Map<string, string>()
+    const visit = (nodes: readonly CategoryNode[]): void => {
+      for (const category of nodes) {
+        const breadcrumb = formatCategoryBreadcrumb(category.key)
+        for (const workspace of category.workspaces) {
+          map.set(workspace.workspaceId as string, breadcrumb)
+        }
+        visit(category.children)
+      }
+    }
+    visit(groups)
+    return map
+  }, [groups])
+  // While dragging a project (or a nested subgroup), an empty top-level area
+  // still shows a landing line so items can always be moved out to root.
+  const topLevelDropActive =
+    topLevel.length === 0
+    && (dragging === 'workspace' || (dragging === 'category' && draggingNestedCategory))
   // The top-level area is the move-out landing spot: rows reorder with an
   // insertion line (before/after), and the blank space below the last row
   // appends to the end of the list. No whole-area highlight box.
   const topLevelRef: DropRowRef = { kind: 'topLevel', key: UNCATEGORIZED_KEY }
 
-  // Add workspace flow: self-contained (no directory-flow hole dependency).
+  // Add workspace flow: delegate to the winning `sidebar.workspaces.directoryFlow`
+  // occupant when present (supporting `@yh4922/dsh-workspace` and official pickers),
+  // falling back to `pickDirectory()` otherwise.
+  const directoryFlowEntry = useDirectoryFlowEntry(directoryFlow)
+  const [flowOpen, setFlowOpen] = useState(false)
   const [adding, setAdding] = useState(false)
   const [addError, setAddError] = useState<string | null>(null)
   const [addErrorOpen, setAddErrorOpen] = useState(false)
-  const addWorkspace = async (): Promise<void> => {
-    if (adding) return
+
+  useEffect(() => {
+    if (flowOpen && directoryFlowEntry === null) {
+      setFlowOpen(false)
+    }
+  }, [flowOpen, directoryFlowEntry])
+
+  const adoptPickedDirectory = async (path: string): Promise<void> => {
     setAdding(true)
     setAddError(null)
     setAddErrorOpen(false)
+    try {
+      const workspace = await createWorkspace({ path })
+      setFlowOpen(false)
+      startSession(workspace.workspaceId)
+    } catch (reason) {
+      const message = reason instanceof Error ? reason.message : String(reason)
+      setFlowOpen(false)
+      setAddError(message)
+      setAddErrorOpen(true)
+    } finally {
+      setAdding(false)
+    }
+  }
+
+  const addWorkspace = async (): Promise<void> => {
+    if (adding || flowOpen) return
+    setAddError(null)
+    setAddErrorOpen(false)
+    if (directoryFlowEntry !== null) {
+      setFlowOpen(true)
+      return
+    }
+    setAdding(true)
     try {
       const path = await pickDirectory()
       if (path === null) return // cancelled
@@ -397,11 +514,43 @@ export function GroupsBrowser({
     setSessionRenameError(null)
   }
 
+  // The strip is a child of this component (rendered through a DOM portal), so
+  // it shares this fiber's props directly: renames call the dialog owner here,
+  // and activation goes through the same navigation verb the sidebar rows use.
+  const activateTab = (sessionId: SessionId) => { open(sessionId) }
+
   const onSessionArchive = (sessionId: SessionId) => {
     archiveSession(sessionId).catch((reason: unknown) => {
       console.warn('session archive rejected:', reason)
     })
   }
+
+  // "Open in folder": the host half of the official open-in-app plugin resolves
+  // which applications it can launch; the project row then just posts the
+  // project directory to that host's launch route. One availability read per
+  // mount — a host without the capability (or a refused read) leaves
+  // `folderApp` undefined, which drops the menu entry rather than failing.
+  const [folderApp, setFolderApp] = useState<string | undefined>(undefined)
+  const [folderError, setFolderError] = useState<{ id: number; text: string } | null>(null)
+  useEffect(() => {
+    const controller = new AbortController()
+    fetchOpenInApps(controller.signal).then((apps) => {
+      if (controller.signal.aborted) return
+      setFolderApp(folderAppId(apps))
+    }).catch(() => { /* no capability: the row simply offers no folder entry */ })
+    return () => { controller.abort() }
+  }, [])
+
+  const openInFolder = folderApp === undefined
+    ? undefined
+    : (workspaceId: WorkspaceId): void => {
+        const workspace = workspaces.find(w => w.workspaceId === workspaceId)
+        if (workspace === undefined) return
+        openPathInApp(folderApp, workspace.path).catch((reason: unknown) => {
+          const detail = reason instanceof Error ? reason.message : String(reason)
+          setFolderError({ id: Date.now(), text: `${t('workspace.openInFolderError')}: ${detail}` })
+        })
+      }
 
   // ---- Runtime group management ----------------------------------------------
 
@@ -416,43 +565,39 @@ export function GroupsBrowser({
   const takenNames = useMemo(() => takenCategoryNames(config, manual), [config, manual])
 
   const groupTrimmed = groupDraft.trim()
+  const groupParentKey = groupDialog === null
+    ? undefined
+    : groupDialog.mode === 'create'
+      ? groupDialog.parentKey
+      : parentCategoryKey(groupDialog.from)
+  const candidateNormalizedPath = groupDialog !== null && groupTrimmed !== ''
+    ? normalizeCategoryPath(joinCategoryPath(groupParentKey, groupTrimmed))
+    : null
   const groupNameIssue = groupDialog !== null && groupTrimmed !== ''
     ? (groupTrimmed === UNCATEGORIZED_LABEL
         ? t('group.nameReserved')
-        : (groupDialog.mode === 'rename' && groupTrimmed === groupDialog.from)
-          ? null
-          : takenNames.has(groupTrimmed) ? t('group.nameDuplicate') : null)
+        : candidateNormalizedPath === null
+          ? t('group.nameInvalid')
+          : (groupDialog.mode === 'rename' && candidateNormalizedPath === groupDialog.from)
+            ? null
+            : (groupDialog.mode === 'rename' && isSameOrDescendantCategory(candidateNormalizedPath, groupDialog.from))
+              ? t('group.nameCycle')
+              : takenNames.has(candidateNormalizedPath)
+                ? t('group.nameDuplicate')
+                : null)
     : null
-  const groupBlocked = groupBusy || groupTrimmed === '' || groupNameIssue !== null
-    || (groupDialog !== null && groupDialog.mode === 'rename' && groupTrimmed === groupDialog.from)
+  const groupBlocked = groupBusy || groupTrimmed === '' || candidateNormalizedPath === null || groupNameIssue !== null
+    || (groupDialog !== null && groupDialog.mode === 'rename' && candidateNormalizedPath === groupDialog.from)
 
   const confirmGroupDialog = () => {
-    if (groupBlocked || groupDialog === null) return
-    const name = groupTrimmed
+    if (groupBlocked || groupDialog === null || candidateNormalizedPath === null) return
+    const nextPath = candidateNormalizedPath
     const from = groupDialog.mode === 'rename' ? groupDialog.from : undefined
-    const renaming = groupDialog.mode === 'rename' && from !== name
+    const renaming = groupDialog.mode === 'rename' && from !== undefined && from !== nextPath
 
-    let next: NormalizedManual
-    if (groupDialog.mode === 'create') {
-      next = { ...manual, categories: [...manual.categories, name] }
-    } else {
-      // Rename: rule groups ride the `renamed` map, manual groups the list;
-      // every reference (assignments / workspaceOrder / categoryOrder) follows.
-      const originalRule = from !== undefined ? originalRuleNameForDisplay(config.categories, manual, from) : undefined
-      next = {
-        ...manual,
-        ...(originalRule !== undefined
-          ? { renamed: { ...manual.renamed, [originalRule]: name } }
-          : { categories: manual.categories.map(c => c === from ? name : c) }),
-        assignments: Object.fromEntries(
-          Object.entries(manual.assignments).map(([id, category]): [string, string | null] => [id, category === from ? name : category]),
-        ),
-        workspaceOrder: Object.fromEntries(
-          Object.entries(manual.workspaceOrder).map(([key, ids]): [string, string[]] => [key === from ? name : key, ids]),
-        ),
-        categoryOrder: manual.categoryOrder.map(key => key === from ? name : key),
-      }
-    }
+    const next = groupDialog.mode === 'create'
+      ? createCategoryInManual(config, manual, nextPath)
+      : renameOrMoveCategoryInManual(config, manual, from as string, nextPath)
 
     setGroupBusy(true)
     setGroupError(null)
@@ -462,42 +607,35 @@ export function GroupsBrowser({
       setGroupBusy(false)
       setGroupDialog(null)
       setGroupDraft('')
-      // Keep the renamed group open (its old expansion key is dropped by retainKeys).
-      if (renaming) actions.setCategoryExpanded(name, true)
+      if (groupDialog.mode === 'create') {
+        for (const key of ancestorCategoryKeys(nextPath)) {
+          actions.setCategoryExpanded(key, true)
+        }
+        actions.setCategoryExpanded(nextPath, true)
+      } else if (renaming && from !== undefined) {
+        for (const [key, expanded] of Object.entries(categoryExpansion)) {
+          if (expanded && isSameOrDescendantCategory(key, from)) {
+            actions.setCategoryExpanded(replaceCategoryPrefix(key, from, nextPath), true)
+          }
+        }
+        actions.setCategoryExpanded(nextPath, true)
+      }
     }).catch((reason: unknown) => {
       setGroupBusy(false)
       setGroupError(reason instanceof Error ? reason.message : String(reason))
     })
   }
 
+  const groupDeleteHasSubgroups = useMemo(() => {
+    if (groupDeleteTarget === null) return false
+    return allCategoryKeys(config, manual).some(
+      k => k !== groupDeleteTarget && isSameOrDescendantCategory(k, groupDeleteTarget),
+    )
+  }, [config, manual, groupDeleteTarget])
+
   const confirmGroupDelete = () => {
     if (groupDeleting || groupDeleteTarget === null) return
-    const name = groupDeleteTarget
-    const originalRule = originalRuleNameForDisplay(config.categories, manual, name)
-
-    // Every project currently in the group goes to 未分类 (forced, not rule-
-    // reclassified), regardless of how it landed there.
-    const assignments = { ...manual.assignments }
-    for (const workspace of workspaces) {
-      if (resolveCategory(config, manual, workspace.workspaceId, workspace.path, workspace.title) === name) {
-        assignments[workspace.workspaceId] = null
-      }
-    }
-    const workspaceOrder = Object.fromEntries(
-      Object.entries(manual.workspaceOrder).filter(([key]) => key !== name),
-    )
-    const next: NormalizedManual = {
-      ...manual,
-      assignments,
-      workspaceOrder,
-      categoryOrder: manual.categoryOrder.filter(key => key !== name),
-      ...(originalRule !== undefined
-        ? {
-            renamed: Object.fromEntries(Object.entries(manual.renamed).filter(([key]) => key !== originalRule)),
-            hidden: [...manual.hidden, originalRule],
-          }
-        : { categories: manual.categories.filter(c => c !== name) }),
-    }
+    const next = deleteCategorySubtreeInManual(config, manual, workspaces, groupDeleteTarget)
 
     setGroupDeleting(true)
     setGroupDeleteError(null)
@@ -512,9 +650,22 @@ export function GroupsBrowser({
     })
   }
 
-  // ---- Drag & drop (move/reorder workspaces, reorder groups) ------------------
+  // ---- Drag & drop (move/reorder workspaces, reorder/nest groups) ------------
 
   const [dragIndicator, setDragIndicator] = useState<DragIndicator>(null)
+  // `dataTransfer.getData()` is unreadable during `dragover`, so track the
+  // currently dragged category key in a ref for live cycle/nest checks.
+  const draggedCategoryRef = useRef<string | null>(null)
+  const springExpandTimerRef = useRef<number | null>(null)
+  const springTargetKeyRef = useRef<string | null>(null)
+
+  const clearSpringExpand = (): void => {
+    if (springExpandTimerRef.current !== null) {
+      window.clearTimeout(springExpandTimerRef.current)
+      springExpandTimerRef.current = null
+    }
+    springTargetKeyRef.current = null
+  }
 
   // Expansion state taken at dragstart; dragend restores it so the folding
   // caused by a drag is always undone afterwards ("结束后恢复").
@@ -524,12 +675,34 @@ export function GroupsBrowser({
   const liveExpansionRef = useRef({ categoryExpansion, workspaceExpansion, actions })
   liveExpansionRef.current = { categoryExpansion, workspaceExpansion, actions }
 
+  const scheduleSpringExpand = (key: string): void => {
+    if (springTargetKeyRef.current === key) return
+    clearSpringExpand()
+    if (liveExpansionRef.current.categoryExpansion[key] === true) return
+    springTargetKeyRef.current = key
+    springExpandTimerRef.current = window.setTimeout(() => {
+      springExpandTimerRef.current = null
+      springTargetKeyRef.current = null
+      liveExpansionRef.current.actions.setCategoryExpanded(key, true)
+    }, SPRING_EXPAND_DELAY_MS)
+  }
+
+  const preserveExpandedAfterDrag = (key: string): void => {
+    if (expansionSnapshot.current !== null) {
+      expansionSnapshot.current.categories[key] = true
+    }
+    actions.setCategoryExpanded(key, true)
+  }
+
   // Cancel any stale indicator when a drag ends outside a row (or is aborted),
   // and restore the expansion snapshot taken at dragstart.
   useEffect(() => {
     const clear = () => {
+      clearSpringExpand()
+      draggedCategoryRef.current = null
       setDragIndicator(null)
       setDragging(null)
+      setDraggingNestedCategory(false)
       const snapshot = expansionSnapshot.current
       if (snapshot === null) return
       expansionSnapshot.current = null
@@ -542,7 +715,10 @@ export function GroupsBrowser({
       }
     }
     document.addEventListener('dragend', clear)
-    return () => { document.removeEventListener('dragend', clear) }
+    return () => {
+      clearSpringExpand()
+      document.removeEventListener('dragend', clear)
+    }
   }, [])
 
   /** Move a workspace into a category (or reorder inside it when `beforeWorkspaceId`/`afterWorkspaceId`). */
@@ -550,6 +726,11 @@ export function GroupsBrowser({
     if (manualSaving) return
     const workspace = workspaces.find(w => w.workspaceId === workspaceId)
     if (workspace === undefined) return
+    if (categoryKey !== UNCATEGORIZED_KEY) {
+      for (const anc of [...ancestorCategoryKeys(categoryKey), categoryKey]) {
+        preserveExpandedAfterDrag(anc)
+      }
+    }
     setManualSaving(true)
     try {
       let next: NormalizedManual
@@ -588,7 +769,6 @@ export function GroupsBrowser({
       await saveManualOverlay(next)
       setManual(next)
       setManualError(null)
-      if (categoryKey !== UNCATEGORIZED_KEY) actions.setCategoryExpanded(categoryKey, true)
     } catch (reason) {
       setManualError(reason instanceof Error ? reason.message : String(reason))
     } finally {
@@ -596,18 +776,74 @@ export function GroupsBrowser({
     }
   }
 
-  /** Reorder groups: move `draggedKey` before `beforeKey` or after `afterKey` (未分类 target = append). */
-  const moveCategory = async (draggedKey: string, beforeKey?: string, afterKey?: string): Promise<void> => {
-    if (manualSaving || draggedKey === beforeKey || draggedKey === afterKey) return
+  /** Reorder or nest a category relative to `targetKey`. */
+  const moveCategory = async (
+    draggedKey: string,
+    targetKey: string,
+    position: 'before' | 'after' | 'into',
+  ): Promise<void> => {
+    if (manualSaving || draggedKey === targetKey) return
+    const result = reorderCategoryInManual(config, manual, draggedKey, targetKey, position)
+    if (!result.ok) {
+      if (result.reason === 'duplicate') setManualError(t('group.moveDuplicateError'))
+      else if (result.reason === 'cycle') setManualError(t('group.moveCycleError'))
+      return
+    }
+    if (result.expandedParent !== undefined) {
+      for (const anc of [...ancestorCategoryKeys(result.expandedParent), result.expandedParent]) {
+        preserveExpandedAfterDrag(anc)
+      }
+    }
+    if (result.newKey !== draggedKey) {
+      if (expansionSnapshot.current !== null) {
+        const remapped: Record<string, boolean> = {}
+        for (const [k, v] of Object.entries(expansionSnapshot.current.categories)) {
+          remapped[replaceCategoryPrefix(k, draggedKey, result.newKey)] = v
+        }
+        expansionSnapshot.current.categories = remapped
+      }
+      for (const [k, v] of Object.entries(categoryExpansion)) {
+        if (v && isSameOrDescendantCategory(k, draggedKey)) {
+          actions.setCategoryExpanded(replaceCategoryPrefix(k, draggedKey, result.newKey), true)
+        }
+      }
+    }
     setManualSaving(true)
     try {
-      const order = displayCategoryKeys(config, manual)
-      const categoryOrder = afterKey !== undefined
-        ? moveAfter(order, draggedKey, afterKey)
-        : moveBefore(order, draggedKey, beforeKey)
-      const next: NormalizedManual = { ...manual, categoryOrder }
-      await saveManualOverlay(next)
-      setManual(next)
+      await saveManualOverlay(result.manual)
+      setManual(result.manual)
+      setManualError(null)
+    } catch (reason) {
+      setManualError(reason instanceof Error ? reason.message : String(reason))
+    } finally {
+      setManualSaving(false)
+    }
+  }
+
+  /** Un-nest a nested category back to root level. */
+  const moveCategoryToRoot = async (draggedKey: string): Promise<void> => {
+    if (manualSaving) return
+    const result = moveCategoryToRootInManual(config, manual, draggedKey)
+    if (!result.ok) {
+      if (result.reason === 'duplicate') setManualError(t('group.moveDuplicateError'))
+      return
+    }
+    if (expansionSnapshot.current !== null) {
+      const remapped: Record<string, boolean> = {}
+      for (const [k, v] of Object.entries(expansionSnapshot.current.categories)) {
+        remapped[replaceCategoryPrefix(k, draggedKey, result.newKey)] = v
+      }
+      expansionSnapshot.current.categories = remapped
+    }
+    for (const [k, v] of Object.entries(categoryExpansion)) {
+      if (v && isSameOrDescendantCategory(k, draggedKey)) {
+        actions.setCategoryExpanded(replaceCategoryPrefix(k, draggedKey, result.newKey), true)
+      }
+    }
+    setManualSaving(true)
+    try {
+      await saveManualOverlay(result.manual)
+      setManual(result.manual)
       setManualError(null)
     } catch (reason) {
       setManualError(reason instanceof Error ? reason.message : String(reason))
@@ -617,45 +853,40 @@ export function GroupsBrowser({
   }
 
   /**
-   * Drop on a row. The insertion point is re-derived from the drop event's
-   * position (top half = before, bottom half = after), so it always matches
-   * the indicator the user last saw — even when dragover and drop arrive in
-   * the same tick.
+   * Drop on a row. Re-derives the exact drop zone from cursor position so
+   * drop always matches the last rendered visual indicator.
    */
   const onDropRow = (categoryKey: string, row: DropRowRef) => (event: DragEvent): void => {
     event.preventDefault()
-    // Keep the drop from bubbling to the enclosing top-level area (which is
-    // also a move-out target): a row drop and the area-drop below it must not
-    // both fire moveWorkspaceTo.
     event.stopPropagation()
+    clearSpringExpand()
+    const fallbackDraggedCat = draggedCategoryRef.current ?? ''
+    draggedCategoryRef.current = null
     setDragIndicator(null)
     setDragging(null)
-    const draggedCategory = event.dataTransfer.getData(DND_CATEGORY_TYPE)
+    setDraggingNestedCategory(false)
+    const draggedCategory = event.dataTransfer.getData(DND_CATEGORY_TYPE) || fallbackDraggedCat
     if (draggedCategory !== '') {
-      // Group reorder: only category rows are targets (project rows fold
-      // during group drags); before/after follows the drop position.
+      if (row.kind === 'topLevel') {
+        void moveCategoryToRoot(draggedCategory)
+        return
+      }
+      if (row.kind !== 'category') return
       const rect = (event.currentTarget as HTMLElement).getBoundingClientRect()
-      const before = event.clientY < rect.top + rect.height / 2
-      const beforeKey = row.kind === 'category' && before ? row.key : undefined
-      const afterKey = row.kind === 'category' && !before ? row.key : undefined
-      void moveCategory(draggedCategory, beforeKey, afterKey)
+      const ratio = (event.clientY - rect.top) / Math.max(1, rect.height)
+      const position: 'before' | 'after' | 'into' = ratio < 0.25 ? 'before' : ratio > 0.75 ? 'after' : 'into'
+      void moveCategory(draggedCategory, row.key, position)
       return
     }
     const workspaceId = event.dataTransfer.getData(DND_WORKSPACE_TYPE) || event.dataTransfer.getData('text/plain')
     if (workspaceId === '') return
     if (row.kind === 'topLevel') {
-      // Top-level row / top-level blank drop = move OUT of any group (forced
-      // top-level, rules ignored) and set the position inside the ordered
-      // top-level list. A row drop re-derives before/after from the drop
-      // position; a bare area drop (key = UNCATEGORIZED_KEY) appends to the end.
       const rect = (event.currentTarget as HTMLElement).getBoundingClientRect()
       const before = event.clientY < rect.top + rect.height / 2
       const specificKey = row.key === UNCATEGORIZED_KEY ? undefined : row.key
       void moveWorkspaceTo(workspaceId, UNCATEGORIZED_KEY, before ? specificKey : undefined, !before ? specificKey : undefined)
       return
     }
-    // Project move/reorder: a line on a project row = reorder before/after it;
-    // dropping anywhere else in a category = move into the group (its end).
     const rect = (event.currentTarget as HTMLElement).getBoundingClientRect()
     const before = event.clientY < rect.top + rect.height / 2
     const beforeWsid = row.kind === 'workspace' && before ? row.key : undefined
@@ -666,24 +897,63 @@ export function GroupsBrowser({
   const onDragOverRow = (row: DropRowRef) => (event: DragEvent): void => {
     if (!hasPluginDragType(event.dataTransfer.types)) return
     const draggingCategory = Array.from(event.dataTransfer.types as Iterable<string>).includes(DND_CATEGORY_TYPE)
-    if (draggingCategory && row.kind !== 'category') return // group drags target category rows only
+    const activeCat = draggedCategoryRef.current
+    if (draggingCategory) {
+      if (row.kind === 'topLevel') {
+        if (activeCat === null || parentCategoryKey(activeCat) === undefined) return
+        clearSpringExpand()
+        event.preventDefault()
+        event.stopPropagation()
+        event.dataTransfer.dropEffect = 'move'
+        setDragIndicator(prev =>
+          prev?.mode === 'line' && prev.row.kind === row.kind && prev.row.key === row.key && prev.before === false
+            ? prev
+            : { mode: 'line', row, before: false })
+        return
+      }
+      if (row.kind !== 'category') return
+      if (activeCat !== null && isSameOrDescendantCategory(row.key, activeCat)) {
+        clearSpringExpand()
+        setDragIndicator(null)
+        return
+      }
+      event.preventDefault()
+      event.stopPropagation()
+      event.dataTransfer.dropEffect = 'move'
+      const rect = (event.currentTarget as HTMLElement).getBoundingClientRect()
+      const ratio = (event.clientY - rect.top) / Math.max(1, rect.height)
+      if (ratio < 0.25) {
+        clearSpringExpand()
+        setDragIndicator(prev =>
+          prev?.mode === 'line' && prev.row.kind === row.kind && prev.row.key === row.key && prev.before === true
+            ? prev
+            : { mode: 'line', row, before: true })
+      } else if (ratio > 0.75) {
+        clearSpringExpand()
+        setDragIndicator(prev =>
+          prev?.mode === 'line' && prev.row.kind === row.kind && prev.row.key === row.key && prev.before === false
+            ? prev
+            : { mode: 'line', row, before: false })
+      } else {
+        scheduleSpringExpand(row.key)
+        setDragIndicator(prev =>
+          prev?.mode === 'into' && prev.categoryKey === row.key ? prev : { mode: 'into', categoryKey: row.key })
+      }
+      return
+    }
     event.preventDefault()
-    // Keep a row's dragover from bubbling to the enclosing top-level area
-    // (which would interpret it as the end-of-list landing).
     event.stopPropagation()
     event.dataTransfer.dropEffect = 'move'
     const rect = (event.currentTarget as HTMLElement).getBoundingClientRect()
     const before = event.clientY < rect.top + rect.height / 2
-    if (draggingCategory || row.kind === 'workspace' || row.kind === 'topLevel') {
-      // Group reorder (line on a category row), project reorder inside a
-      // group (line on a project row), or top-level reorder (line on a
-      // top-level project row).
+    if (row.kind === 'workspace' || row.kind === 'topLevel') {
+      clearSpringExpand()
       setDragIndicator(prev =>
         prev?.mode === 'line' && prev.row.kind === row.kind && prev.row.key === row.key && prev.before === before
           ? prev
           : { mode: 'line', row, before })
     } else {
-      // Dropping a project INTO a group: whole-row highlight.
+      scheduleSpringExpand(row.key)
       setDragIndicator(prev =>
         prev?.mode === 'into' && prev.categoryKey === row.key ? prev : { mode: 'into', categoryKey: row.key })
     }
@@ -691,19 +961,21 @@ export function GroupsBrowser({
 
   const onDragLeaveRow = (event: DragEvent): void => {
     if (event.currentTarget.contains(event.relatedTarget as Node | null)) return
+    clearSpringExpand()
     setDragIndicator(null)
   }
 
   /**
-   * Drag over the TOP-LEVEL AREA's blank space (not on a row — rows stop
-   * propagation). An insertion line shows the landing spot: empty top level →
-   * a standalone line under the last group; non-empty → a line below the last
-   * top-level row (end of the list).
+   * Drag over the TOP-LEVEL AREA's blank space (accepts workspaces or nested
+   * categories being un-nested back to root).
    */
   const onDragOverTopLevelArea = (event: DragEvent): void => {
     if (!hasPluginDragType(event.dataTransfer.types)) return
     const draggingCategory = Array.from(event.dataTransfer.types as Iterable<string>).includes(DND_CATEGORY_TYPE)
-    if (draggingCategory) return // group drags never target the top-level area
+    if (draggingCategory && (draggedCategoryRef.current === null || parentCategoryKey(draggedCategoryRef.current) === undefined)) {
+      return
+    }
+    clearSpringExpand()
     event.preventDefault()
     event.dataTransfer.dropEffect = 'move'
     const last = topLevel.length > 0 ? topLevel[topLevel.length - 1] : undefined
@@ -720,12 +992,10 @@ export function GroupsBrowser({
     }
   }
 
-  // While dragging a project, only PROJECT rows fold — every expanded
-  // workspace collapses (inside groups AND top-level); group rows keep their
-  // expansion so the user still sees where groups are. dragend restores the
-  // snapshot taken here.
+  // While dragging a project, collapse expanded workspace rows so groups stand out clearly.
   const onDragStartWorkspace = (_workspaceId: string) => (): void => {
     setDragging('workspace')
+    setDraggingNestedCategory(false)
     expansionSnapshot.current = {
       categories: { ...categoryExpansion },
       workspaces: { ...workspaceExpansion },
@@ -735,19 +1005,24 @@ export function GroupsBrowser({
     }
   }
 
-  // While dragging a group, only GROUP rows fold (their rows stay visible as
-  // reorder targets); project rows keep their expansion. dragend restores the
-  // snapshot taken here.
+  // While dragging a category, fold ONLY workspace sessions + the dragged
+  // category itself so other folders remain open as nested drop targets.
   const onDragStartCategory = (categoryKey: string) => (event: DragEvent): void => {
+    event.stopPropagation()
     event.dataTransfer.setData(DND_CATEGORY_TYPE, categoryKey)
     event.dataTransfer.effectAllowed = 'move'
+    draggedCategoryRef.current = categoryKey
     setDragging('category')
+    setDraggingNestedCategory(parentCategoryKey(categoryKey) !== undefined)
     expansionSnapshot.current = {
       categories: { ...categoryExpansion },
       workspaces: { ...workspaceExpansion },
     }
-    for (const key of Object.keys(categoryExpansion)) {
-      if (categoryExpansion[key]) actions.setCategoryExpanded(key, false)
+    for (const key of Object.keys(workspaceExpansion)) {
+      if (workspaceExpansion[key]) actions.setWorkspaceExpanded(key, false)
+    }
+    if (categoryExpansion[categoryKey]) {
+      actions.setCategoryExpanded(categoryKey, false)
     }
   }
 
@@ -755,6 +1030,20 @@ export function GroupsBrowser({
 
   return (
     <div className={`wgRoot${wide ? '' : ' wgRail'}`}>
+      {/* The tab strip portals itself into the conversation column's head seat,
+          so its position here is irrelevant to where it appears; rendering it
+          from this component is what keeps it on this fiber (and therefore on
+          this store's single scope) while still reaching the other column. */}
+      <SessionTabs
+        useSessions={useSessions}
+        useSessionStatus={useSessionStatus}
+        useWorkspaces={useWorkspaces}
+        useTabs={useTabs}
+        actions={tabActions}
+        activate={activateTab}
+        rename={onSessionRename}
+        t={t}
+      />
       <div className="wgSectionHeader">
         {wide && <span className="wgSectionLabel">{t('section.workspaces')}</span>}
         {wide && (
@@ -765,7 +1054,7 @@ export function GroupsBrowser({
               aria-label={t('search')}
               onClick={() => { setSearchExpanded(true) }}
             >
-              <IconSearchOutline16 size={searchExpanded ? 11 : 14} />
+              <IconSearchOutlineRegular size={searchExpanded ? 11 : 14} />
             </button>
             {searchExpanded && (
               <input
@@ -795,7 +1084,7 @@ export function GroupsBrowser({
                   setSearchExpanded(false)
                 }}
               >
-                <IconCloseFill14 />
+                <IconCloseFillMedium />
               </button>
             )}
           </div>
@@ -811,7 +1100,7 @@ export function GroupsBrowser({
               setGroupDialog({ mode: 'create' })
             }}
           >
-            <IconFolderOpenOutline16 size={wide ? 16 : 18} />
+            <IconFolderOpenOutlineRegular size={wide ? 16 : 18} />
           </button>
         </Tooltip>
         <Tooltip label={t('workspace.add')} side="bottom" delayMs={500}>
@@ -819,10 +1108,10 @@ export function GroupsBrowser({
             type="button"
             className="wgIconButton"
             aria-label={t('workspace.add')}
-            disabled={adding}
-            onClick={addWorkspace}
+            disabled={adding || flowOpen}
+            onClick={() => { void addWorkspace() }}
           >
-            <IconProjectAddOutline16 size={wide ? 16 : 18} />
+            <IconProjectAddOutlineRegular size={wide ? 16 : 18} />
           </button>
         </Tooltip>
       </div>
@@ -836,7 +1125,7 @@ export function GroupsBrowser({
               aria-label={t('search')}
               onClick={() => { setSearchExpanded(true); expandSidebar() }}
             >
-              <IconSearchOutline16 size={18} />
+              <IconSearchOutlineRegular size={18} />
             </button>
           </Tooltip>
         </div>
@@ -855,6 +1144,7 @@ export function GroupsBrowser({
             workspaces={workspaces}
             config={config}
             archivedSessionIds={archivedSessionIds}
+            statuses={statuses}
             query={normalizedQuery}
             remote={remoteSearch}
             resultLimit={searchResultLimit}
@@ -865,7 +1155,13 @@ export function GroupsBrowser({
             t={t}
           />
         ) : (
-          <div className="wgList" role="tree" aria-label={t('section.workspaces')}>
+          /* The branch overlay lives beside the tree, not inside it: it measures
+             the rows and paints behind them, so it must share their box without
+             becoming a row itself (which would break role="tree" semantics and
+             the index-based measurement). */
+          <div className="wgTreeWrap" ref={branchScope}>
+            <FlowerBranch scope={branchScope.current} spinning={currentRunning} />
+            <div className="wgList" role="tree" aria-label={t('section.workspaces')}>
             {groups.length === 0 && topLevel.length === 0 && !topLevelDropActive && (
               <div className="wgEmpty">{workspacePhase === 'ready' ? t('empty.noWorkspaces') : t('empty.none')}</div>
             )}
@@ -880,9 +1176,9 @@ export function GroupsBrowser({
                 onDragOverRow={onDragOverRow}
                 onDragLeaveRow={onDragLeaveRow}
                 onDropRow={onDropRow}
-                onDragStartCategory={onDragStartCategory(category.key)}
+                onDragStartCategory={onDragStartCategory}
                 onDragStartWorkspace={onDragStartWorkspace}
-                onToggleCategory={() => { actions.setCategoryExpanded(category.key, !category.expanded) }}
+                onToggleCategory={(key, nextExpanded) => { actions.setCategoryExpanded(key, nextExpanded) }}
                 onToggleWorkspace={(key) => { actions.setWorkspaceExpanded(key, !workspaceExpansion[key]) }}
                 onNewSession={startSession}
                 onOpen={open}
@@ -898,21 +1194,24 @@ export function GroupsBrowser({
                 onSessionRename={onSessionRename}
                 onSessionArchive={onSessionArchive}
                 onFork={forkSession}
-                onGroupRename={() => {
-                  setGroupDraft(category.key)
+                onGroupCreateSubgroup={(parentKey) => {
+                  setGroupDraft('')
                   setGroupError(null)
-                  setGroupDialog({ mode: 'rename', from: category.key })
+                  setGroupDialog({ mode: 'create', parentKey })
                 }}
-                onGroupDelete={() => {
-                  setGroupDeleteTarget(category.key)
+                onGroupMoveToRoot={(key) => { void moveCategoryToRoot(key) }}
+                onGroupRename={(key) => {
+                  setGroupDraft(categoryLeafName(key))
+                  setGroupError(null)
+                  setGroupDialog({ mode: 'rename', from: key })
+                }}
+                onGroupDelete={(key) => {
+                  setGroupDeleteTarget(key)
                   setGroupDeleteError(null)
                 }}
                 onMoveOut={(workspaceId) => { void moveWorkspaceTo(workspaceId, UNCATEGORIZED_KEY) }}
+                onOpenInFolder={openInFolder}
                 canMoveOut={(workspaceId) => {
-                  // The menu "移出分组" is offered for any project that
-                  // currently sits inside a group (rule-classified or manual) —
-                  // not just overridden ones. Top-level projects
-                  // (resolveCategory === undefined) don't need it.
                   const workspace = workspaces.find(w => w.workspaceId === workspaceId)
                   return workspace !== undefined
                     && resolveCategory(config, manual, workspace.workspaceId, workspace.path, workspace.title) !== undefined
@@ -920,16 +1219,15 @@ export function GroupsBrowser({
               />
             ))}
             {/* Top-level (ungrouped) workspaces, rendered after the group
-                folders. While dragging a project the whole area is the
-                move-out landing spot (a line shows the insert position;
-                an empty top level shows a line under the last group). */}
+                folders. While dragging a project or nested group, the whole area
+                acts as a move-out landing spot. */}
             {(topLevel.length > 0 || topLevelDropActive) && (
               <TopLevelSection
                 topLevel={topLevel}
                 current={current}
                 now={now}
                 t={t}
-                dragging={dragging === 'workspace'}
+                dragging={dragging === 'workspace' || (dragging === 'category' && draggingNestedCategory)}
                 dragIndicator={dragIndicator}
                 topLevelRef={topLevelRef}
                 onDragOverRow={onDragOverRow}
@@ -952,8 +1250,10 @@ export function GroupsBrowser({
                 onSessionRename={onSessionRename}
                 onSessionArchive={onSessionArchive}
                 onFork={forkSession}
+                onOpenInFolder={openInFolder}
               />
             )}
+            </div>
           </div>
         )}
       </div>
@@ -963,7 +1263,13 @@ export function GroupsBrowser({
         open={groupDialog !== null}
         onClose={() => { setGroupDialog(null) }}
         closeLabel={t('close')}
-        title={groupDialog?.mode === 'rename' ? t('group.renameTitle') : t('group.createTitle')}
+        title={
+          groupDialog?.mode === 'rename'
+            ? t('group.renameTitle')
+            : groupDialog?.mode === 'create' && groupDialog.parentKey !== undefined
+              ? t('group.createSubgroupTitle')
+              : t('group.createTitle')
+        }
         footer={(
           <>
             <Button variant="outline" onClick={() => { setGroupDialog(null) }}>{t('group.createCancel')}</Button>
@@ -973,6 +1279,11 @@ export function GroupsBrowser({
           </>
         )}
       >
+        {groupParentKey !== undefined && (
+          <div className="wgDialogBreadcrumb">
+            {t('group.parentLabel')}: {formatCategoryBreadcrumb(groupParentKey)}
+          </div>
+        )}
         <input
           className="wgRenameInput"
           value={groupDraft}
@@ -982,6 +1293,9 @@ export function GroupsBrowser({
           onChange={(e) => { setGroupDraft(e.target.value); setGroupError(null) }}
           onKeyDown={(e) => { if (e.key === 'Enter') confirmGroupDialog() }}
         />
+        {groupDialog?.mode === 'create' && (
+          <div className="wgDialogHint">{t('group.pathHint')}</div>
+        )}
         {groupNameIssue !== null && <div className="wgAddError" role="alert">{groupNameIssue}</div>}
         {groupError !== null && <div className="wgAddError" role="alert">{groupError}</div>}
       </Modal>
@@ -999,7 +1313,9 @@ export function GroupsBrowser({
           </>
         )}
       >
-        <div className="wgAddError">{t('group.deleteConfirm')}</div>
+        <div className="wgAddError">
+          {groupDeleteHasSubgroups ? t('group.deleteConfirmNested') : t('group.deleteConfirm')}
+        </div>
         {groupDeleteError !== null && <div className="wgAddError" role="alert">{groupDeleteError}</div>}
       </Modal>
 
@@ -1068,6 +1384,24 @@ export function GroupsBrowser({
         {sessionRenameError !== null && <div className="wgAddError" role="alert">{sessionRenameError}</div>}
       </Modal>
 
+      {/* Winning `sidebar.workspaces.directoryFlow` picker occupant (e.g. `@yh4922/dsh-workspace`
+          or official pickers); stays mounted across wide/rail transitions. */}
+      <DirectoryFlowHost
+        entry={directoryFlowEntry}
+        resolveProps={directoryFlow.resolveProps}
+        owner={{
+          open: flowOpen,
+          busy: adding,
+          onPicked: (path) => { void adoptPickedDirectory(path) },
+          onCancel: () => { setFlowOpen(false) },
+          onError: (message) => {
+            setFlowOpen(false)
+            setAddError(message)
+            setAddErrorOpen(true)
+          },
+        }}
+      />
+
       {/* Add workspace error dialog */}
       <Modal
         open={addErrorOpen}
@@ -1077,12 +1411,39 @@ export function GroupsBrowser({
         footer={(
           <>
             <Button variant="outline" onClick={() => { setAddErrorOpen(false) }}>{t('close')}</Button>
-            <Button variant="primary" onClick={addWorkspace}>{t('retry')}</Button>
+            <Button variant="primary" onClick={() => { void addWorkspace() }}>{t('retry')}</Button>
           </>
         )}
       >
         <div className="wgAddError" role="alert">{addError}</div>
       </Modal>
+
+      {/* "Open in folder" failure: transient banner, keyed per attempt so a
+          repeat failure restarts the cycle. */}
+      {folderError !== null && (
+        <Toast
+          key={folderError.id}
+          text={folderError.text}
+          icon={<IconWarningOutlineRegular size={16} />}
+          onDone={() => { setFolderError(null) }}
+        />
+      )}
+
+      {/* Ctrl+R quick switch panel (conditionally mounted: fresh query per open). */}
+      {quickOpen && (
+        <QuickPanel
+          onClose={() => { setQuickOpen(false) }}
+          list={list}
+          workspaces={workspaces}
+          archivedSessionIds={archivedSessionIds}
+          categoryByWorkspace={categoryByWorkspace}
+          current={current}
+          startSession={startSession}
+          openSession={open}
+          now={now}
+          t={t}
+        />
+      )}
     </div>
   )
 }
@@ -1099,8 +1460,35 @@ function categoriesForCurrent(
   return resolveCategory(config, manual, workspace.workspaceId, workspace.path, workspace.title)
 }
 
-/** One category section: header row + expanded workspace folders. */
-function CategorySection({ category, current, now, t, dragIndicator, onDragOverRow, onDragLeaveRow, onDropRow, onDragStartCategory, onDragStartWorkspace, onToggleCategory, onToggleWorkspace, onNewSession, onOpen, onRenameRequest, onDeleteRequest, onSessionRename, onSessionArchive, onFork, onGroupRename, onGroupDelete, onMoveOut, canMoveOut }: {
+/** One recursive category section: header row + child subgroups + workspace folders. */
+function CategorySection({
+  category,
+  current,
+  now,
+  t,
+  dragIndicator,
+  onDragOverRow,
+  onDragLeaveRow,
+  onDropRow,
+  onDragStartCategory,
+  onDragStartWorkspace,
+  onToggleCategory,
+  onToggleWorkspace,
+  onNewSession,
+  onOpen,
+  onRenameRequest,
+  onDeleteRequest,
+  onSessionRename,
+  onSessionArchive,
+  onFork,
+  onGroupCreateSubgroup,
+  onGroupMoveToRoot,
+  onGroupRename,
+  onGroupDelete,
+  onMoveOut,
+  canMoveOut,
+  onOpenInFolder,
+}: {
   category: CategoryNode
   current: SessionId | undefined
   now: number
@@ -1108,11 +1496,10 @@ function CategorySection({ category, current, now, t, dragIndicator, onDragOverR
   dragIndicator: DragIndicator
   onDragOverRow: (row: DropRowRef) => (event: DragEvent) => void
   onDragLeaveRow: (event: DragEvent) => void
-  /** Drop factory: bind the target category and the row kind (before/after re-derived at drop time). */
   onDropRow: (categoryKey: string, row: DropRowRef) => (event: DragEvent) => void
-  onDragStartCategory: (event: DragEvent) => void
+  onDragStartCategory: (key: string) => (event: DragEvent) => void
   onDragStartWorkspace: (workspaceId: WorkspaceId) => () => void
-  onToggleCategory: () => void
+  onToggleCategory: (key: string, nextExpanded: boolean) => void
   onToggleWorkspace: (key: string) => void
   onNewSession: (workspaceId?: WorkspaceId) => void
   onOpen: (sessionId: SessionId) => void
@@ -1121,24 +1508,31 @@ function CategorySection({ category, current, now, t, dragIndicator, onDragOverR
   onSessionRename: (sessionId: SessionId, currentTitle: string) => void
   onSessionArchive: (sessionId: SessionId) => void
   onFork: (sessionId: SessionId) => void
-  onGroupRename: () => void
-  onGroupDelete: () => void
+  onGroupCreateSubgroup: (parentKey: string) => void
+  onGroupMoveToRoot: (key: string) => void
+  onGroupRename: (key: string) => void
+  onGroupDelete: (key: string) => void
   onMoveOut: (workspaceId: WorkspaceId) => void
   canMoveOut: (workspaceId: WorkspaceId) => boolean
+  onOpenInFolder?: ((workspaceId: WorkspaceId) => void) | undefined
 }) {
   const categoryLine = dragIndicator?.mode === 'line' && dragIndicator.row.kind === 'category' && dragIndicator.row.key === category.key
     ? (dragIndicator.before ? 'before' : 'after')
     : undefined
   const categoryInto = dragIndicator?.mode === 'into' && dragIndicator.categoryKey === category.key
+  const childDepth = category.depth + 1
   return (
     <div role="group">
       <CategoryRow
         node={category}
         t={t}
-        onToggle={onToggleCategory}
-        onRename={onGroupRename}
-        onDelete={onGroupDelete}
-        onDragStartCategory={onDragStartCategory}
+        onToggle={() => { onToggleCategory(category.key, !category.expanded) }}
+        onCreateSubgroup={() => { onGroupCreateSubgroup(category.key) }}
+        {...(category.depth > 0 ? { onMoveToRoot: () => { onGroupMoveToRoot(category.key) } } : {})}
+        onRename={() => { onGroupRename(category.key) }}
+        onDelete={() => { onGroupDelete(category.key) }}
+        dropNestLabel={t('group.dropNestBadge')}
+        onDragStartCategory={onDragStartCategory(category.key)}
         dropActive={categoryInto}
         {...(categoryLine !== undefined ? { insertLine: categoryLine } : {})}
         onRowDragOver={onDragOverRow({ kind: 'category', key: category.key })}
@@ -1146,18 +1540,57 @@ function CategorySection({ category, current, now, t, dragIndicator, onDragOverR
         onRowDrop={onDropRow(category.key, { kind: 'category', key: category.key })}
       />
       {category.expanded && (
-        <div role="group">
+        <div
+          className="wgSubgroupChildren"
+          role="group"
+          style={{ '--wg-guide-depth': category.depth } as CSSProperties}
+        >
+          {category.children.map((child) => (
+            <CategorySection
+              key={child.key}
+              category={child}
+              current={current}
+              now={now}
+              t={t}
+              dragIndicator={dragIndicator}
+              onDragOverRow={onDragOverRow}
+              onDragLeaveRow={onDragLeaveRow}
+              onDropRow={onDropRow}
+              onDragStartCategory={onDragStartCategory}
+              onDragStartWorkspace={onDragStartWorkspace}
+              onToggleCategory={onToggleCategory}
+              onToggleWorkspace={onToggleWorkspace}
+              onNewSession={onNewSession}
+              onOpen={onOpen}
+              onRenameRequest={onRenameRequest}
+              onDeleteRequest={onDeleteRequest}
+              onSessionRename={onSessionRename}
+              onSessionArchive={onSessionArchive}
+              onFork={onFork}
+              onGroupCreateSubgroup={onGroupCreateSubgroup}
+              onGroupMoveToRoot={onGroupMoveToRoot}
+              onGroupRename={onGroupRename}
+              onGroupDelete={onGroupDelete}
+              onMoveOut={onMoveOut}
+              canMoveOut={canMoveOut}
+              onOpenInFolder={onOpenInFolder}
+            />
+          ))}
           {category.workspaces.map((workspace) => (
             <div key={workspace.workspaceId} role="group">
               <WorkspaceRow
                 node={workspace}
                 t={t}
+                depth={childDepth}
                 onToggle={() => { onToggleWorkspace(workspace.workspaceId as string) }}
                 onNewSession={() => { onNewSession(workspace.workspaceId) }}
                 onRename={() => { onRenameRequest(workspace.workspaceId, workspace.label) }}
                 onDelete={() => { onDeleteRequest(workspace.workspaceId, workspace.label) }}
                 canMoveOut={canMoveOut(workspace.workspaceId)}
                 onMoveOut={() => { onMoveOut(workspace.workspaceId) }}
+                {...(onOpenInFolder !== undefined
+                  ? { onOpenInFolder: () => { onOpenInFolder(workspace.workspaceId) } }
+                  : {})}
                 dropActive={false}
                 {...(dragIndicator?.mode === 'line' && dragIndicator.row.kind === 'workspace' && dragIndicator.row.key === workspace.workspaceId
                   ? { insertLine: dragIndicator.before ? 'before' : 'after' }
@@ -1167,19 +1600,24 @@ function CategorySection({ category, current, now, t, dragIndicator, onDragOverR
                 onRowDrop={onDropRow(category.key, { kind: 'workspace', key: workspace.workspaceId })}
                 onDragStartExtra={onDragStartWorkspace(workspace.workspaceId)}
               />
-              {workspace.expanded && workspace.sessions.map((session) => (
-                <SessionRow
-                  key={session.id}
-                  node={session}
-                  currentId={current}
-                  now={now}
-                  t={t}
-                  onOpen={onOpen}
-                  onRename={onSessionRename}
-                  onFork={onFork}
-                  onArchive={onSessionArchive}
-                />
-              ))}
+              {workspace.expanded && (
+                <TreeChildren>
+                  {workspace.sessions.map((session) => (
+                    <SessionRow
+                      key={session.id}
+                      node={session}
+                      currentId={current}
+                      now={now}
+                      t={t}
+                      workspaceDepth={childDepth}
+                      onOpen={onOpen}
+                      onRename={onSessionRename}
+                      onFork={onFork}
+                      onArchive={onSessionArchive}
+                    />
+                  ))}
+                </TreeChildren>
+              )}
             </div>
           ))}
         </div>
@@ -1197,7 +1635,7 @@ function CategorySection({ category, current, now, t, dragIndicator, onDragOverR
  *   last row);
  * - an empty top level shows a standalone line under the last group folder.
  */
-function TopLevelSection({ topLevel, current, now, t, dragging, dragIndicator, topLevelRef, onDragOverRow, onDragOverTopLevelArea, onDragLeaveRow, onDropRow, onDragStartWorkspace, onToggleWorkspace, onNewSession, onOpen, onRenameRequest, onDeleteRequest, onSessionRename, onSessionArchive, onFork }: {
+function TopLevelSection({ topLevel, current, now, t, dragging, dragIndicator, topLevelRef, onDragOverRow, onDragOverTopLevelArea, onDragLeaveRow, onDropRow, onDragStartWorkspace, onToggleWorkspace, onNewSession, onOpen, onRenameRequest, onDeleteRequest, onSessionRename, onSessionArchive, onFork, onOpenInFolder }: {
   topLevel: readonly WorkspaceGroupNode[]
   current: SessionId | undefined
   now: number
@@ -1219,6 +1657,8 @@ function TopLevelSection({ topLevel, current, now, t, dragging, dragIndicator, t
   onSessionRename: (sessionId: SessionId, currentTitle: string) => void
   onSessionArchive: (sessionId: SessionId) => void
   onFork: (sessionId: SessionId) => void
+  /** Absent when the host resolved no folder application. */
+  onOpenInFolder?: ((workspaceId: WorkspaceId) => void) | undefined
 }) {
   const emptyLineActive = dragIndicator?.mode === 'line' && dragIndicator.row.kind === 'topLevel' && dragIndicator.row.key === topLevelRef.key
   return (
@@ -1247,10 +1687,14 @@ function TopLevelSection({ topLevel, current, now, t, dragging, dragIndicator, t
             node={workspace}
             t={t}
             flat
+            depth={0}
             onToggle={() => { onToggleWorkspace(workspace.workspaceId as string) }}
             onNewSession={() => { onNewSession(workspace.workspaceId) }}
             onRename={() => { onRenameRequest(workspace.workspaceId, workspace.label) }}
             onDelete={() => { onDeleteRequest(workspace.workspaceId, workspace.label) }}
+            {...(onOpenInFolder !== undefined
+              ? { onOpenInFolder: () => { onOpenInFolder(workspace.workspaceId) } }
+              : {})}
             {...(dragIndicator?.mode === 'line' && dragIndicator.row.kind === 'topLevel' && dragIndicator.row.key === workspace.workspaceId
               ? { insertLine: dragIndicator.before ? 'before' : 'after' }
               : {})}
@@ -1259,35 +1703,99 @@ function TopLevelSection({ topLevel, current, now, t, dragging, dragIndicator, t
             onRowDrop={onDropRow(UNCATEGORIZED_KEY, { kind: 'topLevel', key: workspace.workspaceId })}
             onDragStartExtra={onDragStartWorkspace(workspace.workspaceId)}
           />
-          {workspace.expanded && workspace.sessions.map((session) => (
-            <SessionRow
-              key={session.id}
-              node={session}
-              currentId={current}
-              now={now}
-              t={t}
-              onOpen={onOpen}
-              onRename={onSessionRename}
-              onFork={onFork}
-              onArchive={onSessionArchive}
-            />
-          ))}
+          {workspace.expanded && (
+            <TreeChildren>
+              {workspace.sessions.map((session) => (
+                <SessionRow
+                  key={session.id}
+                  node={session}
+                  currentId={current}
+                  now={now}
+                  t={t}
+                  workspaceDepth={0}
+                  onOpen={onOpen}
+                  onRename={onSessionRename}
+                  onFork={onFork}
+                  onArchive={onSessionArchive}
+                />
+              ))}
+            </TreeChildren>
+          )}
         </div>
       ))}
     </div>
   )
 }
 
+function SearchCategorySection({ category, current, now, open, t }: {
+  category: CategoryNode
+  current: SessionId | undefined
+  now: number
+  open: (sessionId: SessionId) => void
+  t: GroupsBrowserProps['t']
+}) {
+  const childDepth = category.depth + 1
+  return (
+    <div role="group">
+      <CategoryRow node={category} t={t} onToggle={() => {}} />
+      <div
+        className="wgSubgroupChildren"
+        role="group"
+        style={{ '--wg-guide-depth': category.depth } as CSSProperties}
+      >
+        {category.children.map((child) => (
+          <SearchCategorySection
+            key={child.key}
+            category={child}
+            current={current}
+            now={now}
+            open={open}
+            t={t}
+          />
+        ))}
+        {category.workspaces.map((workspace) => (
+          <div key={workspace.workspaceId} role="group">
+            <WorkspaceRow
+              node={workspace}
+              t={t}
+              depth={childDepth}
+              onToggle={() => {}}
+              onNewSession={() => {}}
+              onRename={() => {}}
+              onDelete={() => {}}
+            />
+            <div role="group">
+              {workspace.sessions.map((session) => (
+                <SessionRow
+                  key={session.id}
+                  node={session}
+                  currentId={current}
+                  now={now}
+                  t={t}
+                  workspaceDepth={childDepth}
+                  onOpen={open}
+                  onRename={() => {}}
+                  onFork={() => {}}
+                  onArchive={() => {}}
+                />
+              ))}
+            </div>
+          </div>
+        ))}
+      </div>
+    </div>
+  )
+}
+
 /**
- * Search body rendered as a three-level tree pruned to matched branches:
- * 分类文件夹 → 项目文件夹 → 命中会话行. Reuses the same row components as
- * the idle tree, so search keeps the same folder hierarchy the user is used to.
+ * Search body rendered as a recursive multi-level tree pruned to matched branches.
  */
-function SearchBody({ list, workspaces, config, archivedSessionIds, query, remote, resultLimit, current, now, open, manual, t }: {
+function SearchBody({ list, workspaces, config, archivedSessionIds, statuses, query, remote, resultLimit, current, now, open, manual, t }: {
   list: SessionListState
   workspaces: readonly WorkspaceView[]
   config: GroupsConfig
   archivedSessionIds: readonly SessionId[]
+  statuses: SessionStatusSnapshot
   query: string
   remote: RemoteSearchState
   resultLimit: number
@@ -1303,8 +1811,8 @@ function SearchBody({ list, workspaces, config, archivedSessionIds, query, remot
     [list, workspaces, config, query, archivedSessionIds, currentRemote, resultLimit],
   )
   const searchTree = useMemo(
-    () => deriveSearchGroups(list, workspaces, config, matches.matchedIds, archivedSessionIds, manual, matches.snippetsBySession),
-    [list, workspaces, config, matches, archivedSessionIds, manual],
+    () => deriveSearchGroups(list, workspaces, config, matches.matchedIds, archivedSessionIds, manual, matches.snippetsBySession, statuses),
+    [list, workspaces, config, matches, archivedSessionIds, manual, statuses],
   )
   const groups = searchTree.categories
   const searchTopLevel = searchTree.topLevel
@@ -1313,38 +1821,14 @@ function SearchBody({ list, workspaces, config, archivedSessionIds, query, remot
   return (
     <div className="wgList" role="tree" aria-label={t('search.results.aria')}>
       {groups.map((category) => (
-        <div key={category.key} role="group">
-          <CategoryRow node={category} t={t} onToggle={() => {}} />
-          <div role="group">
-            {category.workspaces.map((workspace) => (
-              <div key={workspace.workspaceId} role="group">
-                <WorkspaceRow
-                  node={workspace}
-                  t={t}
-                  onToggle={() => {}}
-                  onNewSession={() => {}}
-                  onRename={() => {}}
-                  onDelete={() => {}}
-                />
-                <div role="group">
-                  {workspace.sessions.map((session) => (
-                    <SessionRow
-                      key={session.id}
-                      node={session}
-                      currentId={current}
-                      now={now}
-                      t={t}
-                      onOpen={open}
-                      onRename={() => {}}
-                      onFork={() => {}}
-                      onArchive={() => {}}
-                    />
-                  ))}
-                </div>
-              </div>
-            ))}
-          </div>
-        </div>
+        <SearchCategorySection
+          key={category.key}
+          category={category}
+          current={current}
+          now={now}
+          open={open}
+          t={t}
+        />
       ))}
       {searchTopLevel.map((workspace) => (
         <div key={workspace.workspaceId} role="group">
@@ -1352,6 +1836,7 @@ function SearchBody({ list, workspaces, config, archivedSessionIds, query, remot
             node={workspace}
             t={t}
             flat
+            depth={0}
             onToggle={() => {}}
             onNewSession={() => {}}
             onRename={() => {}}
@@ -1365,6 +1850,7 @@ function SearchBody({ list, workspaces, config, archivedSessionIds, query, remot
                 currentId={current}
                 now={now}
                 t={t}
+                workspaceDepth={0}
                 onOpen={open}
                 onRename={() => {}}
                 onFork={() => {}}

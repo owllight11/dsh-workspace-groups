@@ -8,19 +8,20 @@
  * workspace rows, standing for their containing category) are drop targets.
  * The payload is a custom dataTransfer type so only in-plugin drags land.
  */
-import { useState, type DragEvent } from 'react'
+import { useState, type CSSProperties, type DragEvent, type ReactNode } from 'react'
 import {
-  IconArchiveOutline20,
-  IconBranchOutline16,
-  IconEditOutline16,
-  IconEllipsisOutline16,
-  IconFolderClose16,
-  IconFolderOpen16,
-  IconFolderOpenOutline16,
-  IconPlusOutline16,
-  IconProjectAddOutline16,
-  IconTriangleRightFill14,
-  IconTrashOutline16,
+  IconArchiveOutlineRegular,
+  IconBranchOutlineRegular,
+  IconEditOutlineRegular,
+  IconEllipsisOutlineRegular,
+  IconFolderCloseMedium,
+  IconFolderOpenMedium,
+  IconFolderOpenOutlineRegular,
+  IconPlusOutlineRegular,
+  IconProjectAddOutlineRegular,
+  IconRightUpOutlineRegular,
+  IconTriangleRightFillMedium,
+  IconTrashOutlineRegular,
   Menu,
   StateDot,
   type StateDotState,
@@ -90,30 +91,71 @@ export interface RowDropProps {
 }
 
 /**
- * One category folder row: toggle, rename/delete menu (every group — rule
- * groups via overlay renames/hides), draggable source for group reorder and
- * drop target for both workspace moves and group reorders.
+ * One category folder row: supports arbitrary nesting depth, toggle,
+ * subgroup creation / move-to-root / rename / delete menu, draggable source
+ * for group reorder/reparenting, and 3-zone drop target.
  */
-export function CategoryRow({ node, t, onToggle, onRename, onDelete, dropActive = false, insertLine, onRowDragOver, onRowDragLeave, onRowDrop, onDragStartCategory }: {
+export function CategoryRow({
+  node,
+  t,
+  onToggle,
+  onCreateSubgroup,
+  onMoveToRoot,
+  onRename,
+  onDelete,
+  dropNestLabel,
+  dropActive = false,
+  insertLine,
+  onRowDragOver,
+  onRowDragLeave,
+  onRowDrop,
+  onDragStartCategory,
+}: {
   node: CategoryNode
   t: T
   onToggle: () => void
+  onCreateSubgroup?: () => void
+  onMoveToRoot?: () => void
   /** Rename/delete actions; the hover menu renders only when both provided. */
   onRename?: () => void
   onDelete?: () => void
-  /** Group reorder source; the row becomes draggable only when provided. */
+  dropNestLabel?: string
+  /** Group reorder/reparent source; the row becomes draggable only when provided. */
   onDragStartCategory?: (event: DragEvent) => void
 } & RowDropProps) {
   const [menuOpen, setMenuOpen] = useState(false)
-  const count = node.workspaces.length
+  const count = node.totalWorkspaceCount
   const manageable = onRename !== undefined && onDelete !== undefined
+  const depthStyle = { '--wg-depth': node.depth } as CSSProperties
+  const menuItems = [
+    ...(onCreateSubgroup !== undefined
+      ? [{ id: 'createSubgroup', label: t('group.createSubgroup'), icon: <IconFolderOpenOutlineRegular size={16} /> }]
+      : []),
+    ...(node.depth > 0 && onMoveToRoot !== undefined
+      ? [{ id: 'moveToRoot', label: t('group.moveToRoot'), icon: <IconRightUpOutlineRegular size={16} /> }]
+      : []),
+    ...(manageable
+      ? [
+          { id: 'rename', label: t('group.rename'), icon: <IconEditOutlineRegular /> },
+          { id: 'delete', label: t('group.delete'), icon: <IconTrashOutlineRegular />, danger: true },
+        ]
+      : []),
+  ]
   return (
     <div
-      className={`wgCategoryRow${dropActive ? ' wgDropTarget' : ''}${insertLine === 'before' ? ' wgInsertBefore' : insertLine === 'after' ? ' wgInsertAfter' : ''}`}
+      className={`wgCategoryRow${node.depth > 0 ? ' wgCategorySub' : ''}${node.containsCurrent ? ' wgCategoryActive' : ''}${manageable ? ' wgCategoryManageable' : ''}${dropActive ? ' wgDropTarget' : ''}${insertLine === 'before' ? ' wgInsertBefore' : insertLine === 'after' ? ' wgInsertAfter' : ''}`}
+      style={depthStyle}
       role="treeitem"
       aria-expanded={node.expanded}
-      aria-label={t('section.workspaces')}
+      aria-label={node.label}
       data-wg-category={node.key}
+      data-wg-depth={node.depth}
+      /* Flower-branch hooks: a category row starts a group, so the stem kinks
+         here. Deliberately NOT marked active even when it contains the open
+         session — the session row below it carries that marker, and only one
+         row may claim it (see BRANCH_ACTIVE_ATTRIBUTE). */
+      data-wg-branch-row=""
+      data-wg-branch-group=""
       draggable={onDragStartCategory !== undefined}
       onClick={onToggle}
       onDragStart={onDragStartCategory}
@@ -122,24 +164,27 @@ export function CategoryRow({ node, t, onToggle, onRename, onDelete, dropActive 
       onDrop={onRowDrop}
     >
       <span className={`wgChevron${node.expanded ? ' wgChevronOpen' : ''}`}>
-        <IconTriangleRightFill14 />
+        <IconTriangleRightFillMedium />
       </span>
       <span className="wgCategoryIcon" data-wg-row-icon="group">
-        {node.expanded ? <IconFolderOpen16 /> : <IconFolderClose16 />}
+        {node.depth > 0
+          ? (node.expanded ? <IconFolderOpenOutlineRegular size={14} /> : <IconFolderCloseMedium size={14} />)
+          : (node.expanded ? <IconFolderOpenMedium /> : <IconFolderCloseMedium />)}
       </span>
-      <span className="wgCategoryLabel">{node.label}</span>
-      <span className="wgCategoryCount">{count}</span>
+      <span className="wgCategoryLabel" title={node.key}>{node.label}</span>
+      {dropActive && dropNestLabel !== undefined
+        ? <span className="wgDropBadge">{dropNestLabel}</span>
+        : <span className="wgCategoryCount">{count}</span>}
       {manageable && (
         <span className="wgRowActions">
           <Menu
             open={menuOpen}
             onClose={() => { setMenuOpen(false) }}
-            items={[
-              { id: 'rename', label: t('group.rename'), icon: <IconEditOutline16 /> },
-              { id: 'delete', label: t('group.delete'), icon: <IconTrashOutline16 />, danger: true },
-            ]}
+            items={menuItems}
             onSelect={(id) => {
               setMenuOpen(false)
+              if (id === 'createSubgroup') onCreateSubgroup?.()
+              if (id === 'moveToRoot') onMoveToRoot?.()
               if (id === 'rename') onRename()
               if (id === 'delete') onDelete()
             }}
@@ -153,10 +198,22 @@ export function CategoryRow({ node, t, onToggle, onRename, onDelete, dropActive 
                 aria-label={`${t('group.rename')} ${node.label}`}
                 onClick={(e) => { e.stopPropagation(); setMenuOpen(v => !v) }}
               >
-                <IconEllipsisOutline16 />
+                <IconEllipsisOutlineRegular />
               </button>
             )}
           />
+          {onCreateSubgroup !== undefined && (
+            <button
+              type="button"
+              className="wgIconButton"
+              draggable={false}
+              title={t('group.createSubgroup')}
+              aria-label={`${t('group.createSubgroup')} ${node.label}`}
+              onClick={(e) => { e.stopPropagation(); onCreateSubgroup() }}
+            >
+              <IconPlusOutlineRegular />
+            </button>
+          )}
         </span>
       )}
     </div>
@@ -164,9 +221,11 @@ export function CategoryRow({ node, t, onToggle, onRename, onDelete, dropActive 
 }
 
 /** One workspace folder row inside a category: draggable source + drop target. */
-export function WorkspaceRow({ node, t, onToggle, onNewSession, onRename, onDelete, canMoveOut = false, onMoveOut, flat = false, dropActive = false, insertLine, onRowDragOver, onRowDragLeave, onRowDrop, onDragStartExtra }: {
+export function WorkspaceRow({ node, t, depth, onToggle, onNewSession, onRename, onDelete, canMoveOut = false, onMoveOut, onOpenInFolder, flat = false, dropActive = false, insertLine, onRowDragOver, onRowDragLeave, onRowDrop, onDragStartExtra }: {
   node: WorkspaceGroupNode
   t: T
+  /** Visual tree depth (`0` for top-level, `category.depth + 1` inside groups). */
+  depth?: number
   onToggle: () => void
   onNewSession: () => void
   onRename: () => void
@@ -174,18 +233,28 @@ export function WorkspaceRow({ node, t, onToggle, onNewSession, onRename, onDele
   /** Project currently sits inside a group — offer "move out of group". */
   canMoveOut?: boolean
   onMoveOut?: () => void
+  /**
+   * Open the project directory in the host's file manager. Omitted when the
+   * host resolved no folder application (no capability, or a remote launch),
+   * which keeps the entry out of the menu entirely.
+   */
+  onOpenInFolder?: () => void
   /** Render as a top-level row (no folder indentation). */
   flat?: boolean
   /** Extra dragstart hook (e.g. collapse all expanded projects while dragging). */
   onDragStartExtra?: () => void
 } & RowDropProps) {
   const [menuOpen, setMenuOpen] = useState(false)
+  const effectiveDepth = depth ?? (flat ? 0 : 1)
   const menuItems = [
-    ...(canMoveOut && onMoveOut !== undefined
-      ? [{ id: 'moveOut', label: t('workspace.moveOutOfGroup'), icon: <IconFolderOpenOutline16 size={16} /> }]
+    ...(onOpenInFolder !== undefined
+      ? [{ id: 'openInFolder', label: t('workspace.openInFolder'), icon: <IconFolderOpenOutlineRegular size={16} /> }]
       : []),
-    { id: 'rename', label: t('workspace.rename'), icon: <IconEditOutline16 /> },
-    { id: 'delete', label: t('workspace.delete'), icon: <IconTrashOutline16 />, danger: true },
+    ...(canMoveOut && onMoveOut !== undefined
+      ? [{ id: 'moveOut', label: t('workspace.moveOutOfGroup'), icon: <IconRightUpOutlineRegular size={16} /> }]
+      : []),
+    { id: 'rename', label: t('workspace.rename'), icon: <IconEditOutlineRegular /> },
+    { id: 'delete', label: t('workspace.delete'), icon: <IconTrashOutlineRegular />, danger: true },
   ]
   const onDragStart = (event: DragEvent): void => {
     event.dataTransfer.setData(DND_WORKSPACE_TYPE, node.workspaceId)
@@ -195,9 +264,20 @@ export function WorkspaceRow({ node, t, onToggle, onNewSession, onRename, onDele
   return (
     <div
       className={`wgProjectRow${node.containsCurrent ? ' wgProjectActive' : ''}${flat ? ' wgProjectFlat' : ''}${dropActive ? ' wgDropTarget' : ''}${insertLine === 'before' ? ' wgInsertBefore' : insertLine === 'after' ? ' wgInsertAfter' : ''}`}
+      style={{ '--wg-depth': effectiveDepth } as CSSProperties}
       role="treeitem"
       aria-expanded={node.expanded}
       data-wsid={node.workspaceId}
+      data-wg-depth={effectiveDepth}
+      /* Branch hooks. A project row IS a branch point: it heads its own run of
+         session rows, so the stem kinks here and curves back in on the first
+         session beneath it. That gives the branch one kink per project, which is
+         the readable rhythm — a single top-level category would otherwise never
+         produce a kink at all.
+         Active is NOT set here: when this project holds the open session, the
+         session row itself carries the marker. */
+      data-wg-branch-row=""
+      data-wg-branch-group=""
       draggable
       onClick={onToggle}
       onDragStart={onDragStart}
@@ -206,12 +286,12 @@ export function WorkspaceRow({ node, t, onToggle, onNewSession, onRename, onDele
       onDrop={onRowDrop}
     >
       <span className={`wgChevron${node.expanded ? ' wgChevronOpen' : ''}`}>
-        <IconTriangleRightFill14 />
+        <IconTriangleRightFillMedium />
       </span>
       <span className="wgCategoryIcon" data-wg-row-icon="project">
         {/* Project rows use the project glyph (same as the official workspace
             browser) so groups (folder glyph) and projects stay distinguishable. */}
-        <IconProjectAddOutline16 />
+        <IconProjectAddOutlineRegular />
       </span>
       <span className="wgProjectLabel" title={node.path}>{node.label}</span>
       <span className="wgRowActions">
@@ -221,6 +301,7 @@ export function WorkspaceRow({ node, t, onToggle, onNewSession, onRename, onDele
           items={menuItems}
           onSelect={(id) => {
             setMenuOpen(false)
+            if (id === 'openInFolder') onOpenInFolder?.()
             if (id === 'moveOut') onMoveOut?.()
             if (id === 'rename') onRename()
             if (id === 'delete') onDelete()
@@ -235,7 +316,7 @@ export function WorkspaceRow({ node, t, onToggle, onNewSession, onRename, onDele
               aria-label={`${t('workspace.rename')} ${node.label}`}
               onClick={(e) => { e.stopPropagation(); setMenuOpen(v => !v) }}
             >
-              <IconEllipsisOutline16 />
+              <IconEllipsisOutlineRegular />
             </button>
           )}
         />
@@ -246,19 +327,37 @@ export function WorkspaceRow({ node, t, onToggle, onNewSession, onRename, onDele
           aria-label={`${t('session.new')} ${node.label}`}
           onClick={(e) => { e.stopPropagation(); onNewSession() }}
         >
-          <IconPlusOutline16 />
+          <IconPlusOutlineRegular />
         </button>
       </span>
     </div>
   )
 }
 
+/**
+ * Children container for one folder's rows.
+ *
+ * Keeps the tree's `role="group"` semantics and gives the rows a single
+ * positioned ancestor. It used to draw a per-folder guide rail; that is now the
+ * flower branch's job (one continuous stem for the whole tree, see
+ * `FlowerBranch.tsx`), so this is structure only.
+ */
+export function TreeChildren({ children }: { children: ReactNode }) {
+  return (
+    <div className="wgTreeChildren" role="group">
+      {children}
+    </div>
+  )
+}
+
 /** One session leaf row. */
-export function SessionRow({ node, currentId, now, t, onOpen, onRename, onFork, onArchive }: {
+export function SessionRow({ node, currentId, now, t, workspaceDepth = 1, onOpen, onRename, onFork, onArchive }: {
   node: SessionNode
   currentId: string | undefined
   now: number
   t: T
+  /** Owning workspace tree depth (`0` for top-level, `category.depth + 1` inside groups). */
+  workspaceDepth?: number
   onOpen: (id: SessionNode['id']) => void
   onRename: (id: SessionNode['id'], currentTitle: string) => void
   onFork: (id: SessionNode['id']) => void
@@ -266,17 +365,27 @@ export function SessionRow({ node, currentId, now, t, onOpen, onRename, onFork, 
 }) {
   const selected = node.id === currentId
   const [menuOpen, setMenuOpen] = useState(false)
-  const showStatus = true
+  // The ACTIVE session hands its status slot to the flower: the branch anchors
+  // on this cell (`anchorX` targets `.wgStatusSlot`), so the bloom and the dot
+  // occupy the same 14px square. Drawing both puts the dot's green "ongoing"
+  // ring (or the loading spinner) on top of the petals, which is what made the
+  // flower look broken. The flower already carries this row's state — it turns
+  // exactly while the session runs — so the dot is redundant here anyway.
+  const showStatus = !selected
   const menuItems = [
-    { id: 'rename', label: t('session.rename'), icon: <IconEditOutline16 /> },
-    { id: 'fork', label: t('session.fork'), icon: <IconBranchOutline16 /> },
-    { id: 'archive', label: t('session.archive'), icon: <IconArchiveOutline20 size={16} /> },
+    { id: 'rename', label: t('session.rename'), icon: <IconEditOutlineRegular /> },
+    { id: 'fork', label: t('session.fork'), icon: <IconBranchOutlineRegular /> },
+    { id: 'archive', label: t('session.archive'), icon: <IconArchiveOutlineRegular size={16} /> },
   ]
   return (
     <div
       className={`wgSessionRow${selected ? ' wgSelected' : ''}${node.matched === true ? ' wgMatched' : ''}`}
+      style={{ '--wg-depth': workspaceDepth } as CSSProperties}
       role="treeitem"
       aria-selected={selected}
+      data-wg-branch-row=""
+      data-wg-depth={workspaceDepth}
+      {...(selected ? { 'data-wg-branch-active': '' } : {})}
       onClick={() => { onOpen(node.id) }}
     >
       <span className="wgStatusSlot">
@@ -308,7 +417,7 @@ export function SessionRow({ node, currentId, now, t, onOpen, onRename, onFork, 
                 aria-label={`${t('session.rename')} ${node.title}`}
                 onClick={(e) => { e.stopPropagation(); setMenuOpen(v => !v) }}
               >
-                <IconEllipsisOutline16 />
+                <IconEllipsisOutlineRegular />
               </button>
             )}
           />

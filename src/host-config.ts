@@ -1,15 +1,18 @@
 /**
- * Sidecar config reading for dsh-workspace-groups. The classification rules
+ * Sidecar config reading for @dsh-xhl/workspace-groups. The classification rules
  * live in a user-editable YAML file (default `~/.dsh/workspace-groups.yaml`),
  * read and validated on the host, served to the browser half as JSON. The
  * core workspace.json and session storage are never touched.
  */
 import { readFile } from 'node:fs/promises'
-import { resolve } from 'node:path'
 import { homedir } from 'node:os'
-import { load as parseYaml } from 'js-yaml'
+import { resolve } from 'node:path'
+import yaml from 'js-yaml'
 import { classify } from './core/matcher.ts'
-import type { GroupsConfig, GroupCategory } from './core/types.ts'
+import { normalizeCategoryPath, type GroupCategory, type GroupRule, type GroupsConfig } from './core/types.ts'
+
+export { classify }
+export type { GroupsConfig, GroupCategory, GroupRule } from './core/types.ts'
 
 /** Default sidecar location: `$DSH_HOME/workspace-groups.yaml` (DSH_HOME falls back to ~/.dsh). */
 export function defaultConfigPath(): string {
@@ -25,7 +28,8 @@ export function parseGroupsConfig(raw: unknown): GroupsConfig {
   if (typeof raw !== 'object' || Array.isArray(raw)) {
     throw new Error('workspace-groups.yaml: top-level value must be a mapping')
   }
-  const categoriesValue = (raw as { categories?: unknown }).categories
+  const doc = raw as Record<string, unknown>
+  const categoriesValue = doc.categories
   const categories: GroupCategory[] = []
   if (categoriesValue === undefined) return { categories: [] }
   if (!Array.isArray(categoriesValue)) {
@@ -35,42 +39,47 @@ export function parseGroupsConfig(raw: unknown): GroupsConfig {
     if (typeof entry !== 'object' || entry === null || Array.isArray(entry)) {
       throw new Error('workspace-groups.yaml: each category must be a mapping')
     }
-    const name = (entry as { name?: unknown }).name
+    const cat = entry as Record<string, unknown>
+    const name = cat.name
     if (typeof name !== 'string' || name.trim() === '') {
       throw new Error('workspace-groups.yaml: each category needs a non-empty name')
     }
-    const rulesValue = (entry as { rules?: unknown }).rules
+    const normalizedName = normalizeCategoryPath(name)
+    if (normalizedName === null) {
+      throw new Error(`workspace-groups.yaml: category "${name}" has an invalid path`)
+    }
+    const rulesValue = cat.rules
     if (rulesValue === undefined) {
-      throw new Error(`workspace-groups.yaml: category "${name}" needs a rules list`)
+      throw new Error(`workspace-groups.yaml: category "${normalizedName}" needs a rules list`)
     }
     if (!Array.isArray(rulesValue)) {
-      throw new Error(`workspace-groups.yaml: category "${name}" rules must be a list`)
+      throw new Error(`workspace-groups.yaml: category "${normalizedName}" rules must be a list`)
     }
-    const rules: GroupCategory['rules'] = []
+    const rules: GroupRule[] = []
     for (const rule of rulesValue) {
       if (typeof rule !== 'object' || rule === null || Array.isArray(rule)) {
-        throw new Error(`workspace-groups.yaml: category "${name}" rule must be a mapping`)
+        throw new Error(`workspace-groups.yaml: category "${normalizedName}" rule must be a mapping`)
       }
       const r = rule as Record<string, unknown>
-      const normalized: GroupCategory['rules'][number] = {}
+      const normalized: GroupRule = {}
       for (const key of ['pathPrefix', 'nameContains', 'basenameContains', 'pathExact'] as const) {
         const value = r[key]
         if (value !== undefined) {
           if (typeof value !== 'string' || value === '') {
-            throw new Error(`workspace-groups.yaml: category "${name}" rule ${key} must be a non-empty string`)
+            throw new Error(`workspace-groups.yaml: category "${normalizedName}" rule ${key} must be a non-empty string`)
           }
           normalized[key] = value
         }
       }
       if (Object.keys(normalized).length === 0) {
-        throw new Error(`workspace-groups.yaml: category "${name}" has a rule with no matchers`)
+        throw new Error(`workspace-groups.yaml: category "${normalizedName}" has a rule with no matchers`)
       }
       rules.push(normalized)
     }
     if (rules.length === 0) {
-      throw new Error(`workspace-groups.yaml: category "${name}" needs at least one rule`)
+      throw new Error(`workspace-groups.yaml: category "${normalizedName}" needs at least one rule`)
     }
-    categories.push({ name: name.trim(), rules })
+    categories.push({ name: normalizedName, rules })
   }
   return { categories }
 }
@@ -88,9 +97,5 @@ export async function readGroupsConfig(path: string): Promise<GroupsConfig> {
     if ((error as NodeJS.ErrnoException).code === 'ENOENT') return { categories: [] }
     throw error
   }
-  const raw = parseYaml(text)
-  return parseGroupsConfig(raw)
+  return parseGroupsConfig(yaml.load(text))
 }
-
-export { classify }
-export type { GroupsConfig, GroupCategory, GroupRule } from './core/types.ts'

@@ -1,19 +1,15 @@
 /**
- * Runtime grouping overlay for dsh-workspace-groups: manual groups created in
+ * Runtime grouping overlay for @dsh-xhl/workspace-groups: manual groups created in
  * the sidebar UI and per-workspace category overrides. Stored in a plugin-
  * owned JSON sidecar (`$DSH_HOME/workspace-groups.manual.json`), separate from
  * the operator YAML — the YAML stays the rule source, this file only records
  * runtime decisions, and writes are atomic (temp file + fsync + rename).
- *
- * The browser PUT route writes the whole overlay (idempotent, last write
- * wins); reads tolerate hand-edited content (parse-only) while the write
- * boundary cross-validates against the current rule categories.
  */
 import { mkdir, open, readFile, rename, unlink } from 'node:fs/promises'
-import { dirname, resolve } from 'node:path'
 import { homedir } from 'node:os'
+import { dirname, resolve } from 'node:path'
 import { ruleDisplayName } from './core/matcher.ts'
-import { TOP_LEVEL_ORDER_KEY, UNCATEGORIZED_LABEL, type ManualGroups } from './core/types.ts'
+import { ancestorCategoryKeys, normalizeCategoryPath, TOP_LEVEL_ORDER_KEY, UNCATEGORIZED_LABEL, type ManualGroups } from './core/types.ts'
 
 /** Default overlay location: `$DSH_HOME/workspace-groups.manual.json`. */
 export function defaultManualPath(): string {
@@ -23,15 +19,26 @@ export function defaultManualPath(): string {
   return resolve(home, 'workspace-groups.manual.json')
 }
 
+function parseStringList(value: unknown, field: string, unique: boolean): string[] {
+  if (!Array.isArray(value)) throw new Error(`workspace-groups.manual.json: ${field} must be a list`)
+  const seen = new Set<string>()
+  const result: string[] = []
+  for (const entry of value) {
+    if (typeof entry !== 'string' || entry.trim() === '') {
+      throw new Error(`workspace-groups.manual.json: ${field} entries must be non-empty strings`)
+    }
+    const trimmed = entry.trim()
+    if (unique && seen.has(trimmed)) {
+      throw new Error(`workspace-groups.manual.json: ${field} has duplicate entry "${trimmed}"`)
+    }
+    seen.add(trimmed)
+    result.push(trimmed)
+  }
+  return result
+}
+
 /**
  * Parse + shape-validate a raw overlay document into a ManualGroups.
- * Validates types only — category references are checked against the rule set
- * at the write boundary (validateManualGroups), because reads must tolerate
- * files written while the rule set was different.
- * @param raw - parsed JSON value.
- * @returns the normalized overlay.
- * @throws when the shape is malformed (non-mapping, bad names, duplicates,
- * the reserved uncategorized label, bad assignment/order values).
  */
 export function parseManualGroups(raw: unknown): ManualGroups {
   if (raw === undefined || raw === null) return { categories: [], assignments: {} }
@@ -50,9 +57,13 @@ export function parseManualGroups(raw: unknown): ManualGroups {
       if (typeof entry !== 'string' || entry.trim() === '') {
         throw new Error('workspace-groups.manual.json: each manual category must be a non-empty string')
       }
-      const name = entry.trim()
-      if (name === UNCATEGORIZED_LABEL) {
-        throw new Error(`workspace-groups.manual.json: manual category name "${name}" is reserved`)
+      const rawName = entry.trim()
+      if (rawName === UNCATEGORIZED_LABEL) {
+        throw new Error(`workspace-groups.manual.json: manual category name "${rawName}" is reserved`)
+      }
+      const name = normalizeCategoryPath(rawName)
+      if (name === null) {
+        throw new Error(`workspace-groups.manual.json: manual category path "${rawName}" is invalid`)
       }
       if (seen.has(name)) {
         throw new Error(`workspace-groups.manual.json: duplicate manual category "${name}"`)
@@ -67,49 +78,61 @@ export function parseManualGroups(raw: unknown): ManualGroups {
     if (typeof source.assignments !== 'object' || source.assignments === null || Array.isArray(source.assignments)) {
       throw new Error('workspace-groups.manual.json: assignments must be a mapping')
     }
-    for (const [workspaceId, category] of Object.entries(source.assignments)) {
+    for (const [workspaceId, category] of Object.entries(source.assignments as Record<string, unknown>)) {
       if (workspaceId.trim() === '') {
         throw new Error('workspace-groups.manual.json: assignment keys must be non-empty')
       }
       if (category === null) {
-        assignments[workspaceId] = null // force uncategorized
+        assignments[workspaceId] = null
         continue
       }
       if (typeof category !== 'string' || category.trim() === '') {
         throw new Error(`workspace-groups.manual.json: assignment "${workspaceId}" must be a category name or null`)
       }
-      assignments[workspaceId] = category.trim()
+      const trimmedCat = category.trim()
+      if (trimmedCat === UNCATEGORIZED_LABEL) {
+        assignments[workspaceId] = UNCATEGORIZED_LABEL
+        continue
+      }
+      const normalizedCat = normalizeCategoryPath(trimmedCat)
+      if (normalizedCat === null) {
+        throw new Error(`workspace-groups.manual.json: assignment "${workspaceId}" has invalid category path "${trimmedCat}"`)
+      }
+      assignments[workspaceId] = normalizedCat
     }
   }
 
   const manual: ManualGroups = { categories, assignments }
+  if (source.categoryOrder !== undefined) manual.categoryOrder = parseStringList(source.categoryOrder, 'categoryOrder', true)
+  if (source.hidden !== undefined) manual.hidden = parseStringList(source.hidden, 'hidden', true)
 
-  if (source.categoryOrder !== undefined) {
-    manual.categoryOrder = parseStringList(source.categoryOrder, 'categoryOrder', true)
-  }
-  if (source.hidden !== undefined) {
-    manual.hidden = parseStringList(source.hidden, 'hidden', true)
-  }
   if (source.renamed !== undefined) {
     if (typeof source.renamed !== 'object' || source.renamed === null || Array.isArray(source.renamed)) {
       throw new Error('workspace-groups.manual.json: renamed must be a mapping')
     }
     const renamed: Record<string, string> = {}
-    for (const [original, display] of Object.entries(source.renamed)) {
-      if (original.trim() === '') throw new Error('workspace-groups.manual.json: renamed keys must be non-empty')
+    for (const [original, display] of Object.entries(source.renamed as Record<string, unknown>)) {
+      if (original.trim() === '') {
+        throw new Error('workspace-groups.manual.json: renamed keys must be non-empty')
+      }
       if (typeof display !== 'string' || display.trim() === '') {
         throw new Error(`workspace-groups.manual.json: renamed "${original}" must be a non-empty string`)
       }
-      renamed[original] = display.trim()
+      const normalizedDisplay = normalizeCategoryPath(display)
+      if (normalizedDisplay === null) {
+        throw new Error(`workspace-groups.manual.json: renamed "${original}" has invalid category path "${display}"`)
+      }
+      renamed[original] = normalizedDisplay
     }
     manual.renamed = renamed
   }
+
   if (source.workspaceOrder !== undefined) {
     if (typeof source.workspaceOrder !== 'object' || source.workspaceOrder === null || Array.isArray(source.workspaceOrder)) {
       throw new Error('workspace-groups.manual.json: workspaceOrder must be a mapping')
     }
     const workspaceOrder: Record<string, string[]> = {}
-    for (const [categoryKey, ids] of Object.entries(source.workspaceOrder)) {
+    for (const [categoryKey, ids] of Object.entries(source.workspaceOrder as Record<string, unknown>)) {
       if (categoryKey.trim() === '') {
         throw new Error('workspace-groups.manual.json: workspaceOrder keys must be non-empty')
       }
@@ -121,41 +144,18 @@ export function parseManualGroups(raw: unknown): ManualGroups {
   return manual
 }
 
-/** Parse a list of non-empty strings, optionally de-duplicated. */
-function parseStringList(value: unknown, field: string, unique: boolean): string[] {
-  if (!Array.isArray(value)) {
-    throw new Error(`workspace-groups.manual.json: ${field} must be a list`)
-  }
-  const seen = new Set<string>()
-  const result: string[] = []
-  for (const entry of value) {
-    if (typeof entry !== 'string' || entry.trim() === '') {
-      throw new Error(`workspace-groups.manual.json: ${field} entries must be non-empty strings`)
-    }
-    const trimmed = entry.trim()
-    if (unique && seen.has(trimmed)) {
-      throw new Error(`workspace-groups.manual.json: ${field} has duplicate entry "${trimmed}"`)
-    }
-    seen.add(trimmed)
-    result.push(trimmed)
-  }
-  return result
-}
-
 /**
- * Cross-validate a parsed overlay against the current rule categories
- * (write boundary only). Every assignment value must be `null`, a rule
- * display name, a manual category name, or the uncategorized label; order
- * keys must reference existing categories; renames/hides must reference
- * actual rule categories.
- * @param manual - parsed overlay.
- * @param ruleCategoryNames - current YAML rule category original names.
- * @throws when the overlay references categories that do not exist.
+ * Cross-validate a parsed overlay against the current rule categories (write boundary only).
  */
 export function validateManualGroups(manual: ManualGroups, ruleCategoryNames: readonly string[]): void {
   const ruleNames = new Set(ruleCategoryNames)
-  const allowed = new Set<string>(ruleCategoryNames.map(name => ruleDisplayName(manual, name)))
-  for (const name of manual.categories) allowed.add(name)
+  const allowed = new Set<string>()
+  const addWithAncestors = (key: string): void => {
+    for (const anc of ancestorCategoryKeys(key)) allowed.add(anc)
+    allowed.add(key)
+  }
+  for (const name of ruleCategoryNames) addWithAncestors(ruleDisplayName(manual, name))
+  for (const name of manual.categories) addWithAncestors(name)
   allowed.add(UNCATEGORIZED_LABEL)
 
   for (const [workspaceId, category] of Object.entries(manual.assignments)) {
@@ -170,7 +170,6 @@ export function validateManualGroups(manual: ManualGroups, ruleCategoryNames: re
     }
   }
   for (const key of Object.keys(manual.workspaceOrder ?? {})) {
-    // The top-level order key is a reserved, non-category list.
     if (key === TOP_LEVEL_ORDER_KEY) continue
     if (!allowed.has(key) || key === UNCATEGORIZED_LABEL) {
       throw new Error(`workspace-groups.manual.json: workspaceOrder references unknown category "${key}"`)
@@ -200,13 +199,7 @@ export async function readManualGroups(path: string): Promise<ManualGroups> {
   return parseManualGroups(JSON.parse(text))
 }
 
-/**
- * Atomically replace the overlay file: write a same-directory temp file,
- * fsync it, then rename over the target. A crash never leaves a torn JSON at
- * the real path (readers see either the old or the new file).
- * @param path - target file path.
- * @param manual - overlay to persist.
- */
+/** Atomically replace the overlay file (temp file + fsync + rename). */
 export async function writeManualGroups(path: string, manual: ManualGroups): Promise<void> {
   const json = `${JSON.stringify(manual, null, 2)}\n`
   await mkdir(dirname(path), { recursive: true })
